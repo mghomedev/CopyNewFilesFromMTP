@@ -764,6 +764,17 @@ foreach ($file in $toProcess) {
             $targetFilePath = Join-Path $TargetFolder $file.RelativePath
             $targetDir = [System.IO.Path]::GetDirectoryName($targetFilePath)
 
+            # Check if file already exists in target with same size
+            if (Test-Path -LiteralPath $targetFilePath) {
+                $existingSize = (Get-Item -LiteralPath $targetFilePath).Length
+                if ($file.Size -lt 0 -or $existingSize -eq $file.Size) {
+                    Write-Host "$progressPrefix SKIP: $($file.RelativePath) - already exists in target folder" -ForegroundColor DarkYellow
+                    $stateWriter.WriteLine($file.RelativePath)
+                    $skipCount++
+                    continue
+                }
+            }
+
             # Create target directory if needed
             if (-not (Test-Path $targetDir)) {
                 New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
