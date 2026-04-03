@@ -27,6 +27,18 @@ This script was developed by [mghomedev](https://github.com/mghomedev) with [Cla
 - **Path discovery** — if a path is not found on the device, lists available items at the last valid level
 - **Safety prompts** — warns if ignore folders are missing/empty or the index is empty
 
+## Installation
+
+### Option 1: Download the EXE (easiest)
+
+Download **`CopyNewFilesFromMTP.exe`** from the [latest release](../../releases/latest). No installation or configuration required — just run it from the command line.
+
+### Option 2: Download the script
+
+Download the repository and use either:
+- **`CopyNewFilesFromMTP.bat`** — double-click friendly wrapper, no PowerShell configuration needed
+- **`CopyNewFilesFromMTP.ps1`** — run directly with `powershell.exe -ExecutionPolicy Bypass -File .\CopyNewFilesFromMTP.ps1 ...`
+
 ## Requirements
 
 - **Windows 10/11** with PowerShell 5.1 (pre-installed)
