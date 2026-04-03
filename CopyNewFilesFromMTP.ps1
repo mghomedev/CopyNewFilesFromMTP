@@ -297,6 +297,21 @@ function Get-MTPDevice {
     throw "MTP device '$Name' not found. Check the name in Windows Explorer."
 }
 
+function List-MTPFolderContents {
+    param([System.__ComObject]$Folder, [string]$LocationLabel)
+
+    Write-Host "[MTP] Available items at '$LocationLabel':" -ForegroundColor Yellow
+    $hasItems = $false
+    foreach ($item in $Folder.Items()) {
+        $hasItems = $true
+        $type = if ($item.IsFolder) { "[Folder]" } else { "[File]" }
+        Write-Host "  $type $($item.Name)" -ForegroundColor Gray
+    }
+    if (-not $hasItems) {
+        Write-Host "  (empty)" -ForegroundColor DarkGray
+    }
+}
+
 function Navigate-MTPPath {
     param(
         [System.__ComObject]$DeviceItem,
@@ -305,15 +320,25 @@ function Navigate-MTPPath {
 
     $currentFolder = $DeviceItem.GetFolder
     $segments = $Path.Split('\', [System.StringSplitOptions]::RemoveEmptyEntries)
+    $resolvedSoFar = @()
 
     foreach ($segment in $segments) {
         $child = $currentFolder.ParseName($segment)
         if ($null -eq $child) {
+            $location = if ($resolvedSoFar.Count -eq 0) { $DeviceItem.Name } else { "$($DeviceItem.Name)\$($resolvedSoFar -join '\')" }
+            Write-Host ""
+            Write-Host "[MTP] ERROR: '$segment' not found under '$location'" -ForegroundColor Red
+            Write-Host ""
+            List-MTPFolderContents -Folder $currentFolder -LocationLabel $location
             throw "Path segment '$segment' not found. Full path: $Path"
         }
         if (-not $child.IsFolder) {
+            $location = if ($resolvedSoFar.Count -eq 0) { $DeviceItem.Name } else { "$($DeviceItem.Name)\$($resolvedSoFar -join '\')" }
+            Write-Host ""
+            Write-Host "[MTP] ERROR: '$segment' is not a folder under '$location'" -ForegroundColor Red
             throw "'$segment' is not a folder. Full path: $Path"
         }
+        $resolvedSoFar += $segment
         $currentFolder = $child.GetFolder
     }
 
