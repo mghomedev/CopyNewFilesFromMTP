@@ -35,7 +35,15 @@ This script was developed by [mghomedev](https://github.com/mghomedev) with [Cla
 
 ## Usage
 
+> **Tip:** If you are not familiar with PowerShell execution policies, use the included **`CopyNewFilesFromMTP.bat`** wrapper instead of calling the `.ps1` script directly. It handles everything for you. Just replace `powershell.exe -ExecutionPolicy Bypass -File .\CopyNewFilesFromMTP.ps1` with `CopyNewFilesFromMTP.bat` in the examples below.
+
 ### First: Test your MTP connection
+
+```cmd
+CopyNewFilesFromMTP.bat -DeviceName "Galaxy S24" -SourcePath "Internal storage\DCIM" -ScanOnly
+```
+
+Or with PowerShell directly:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\CopyNewFilesFromMTP.ps1 `
