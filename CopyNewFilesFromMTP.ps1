@@ -32,6 +32,11 @@
 .PARAMETER ScanCacheFile
     Path to cache the MTP device scan. Default: <TargetFolder>\_mtp_scan_cache.tsv
 
+.PARAMETER ScanOnly
+    Only scan the MTP device source folder and display all found files with sizes.
+    Useful for testing if the MTP connection and path work correctly.
+    When used, -BackupFolders and -TargetFolder are not required.
+
 .PARAMETER RebuildIndex
     Force rebuilding the local backup index even if it already exists.
 
@@ -40,6 +45,13 @@
 
 .PARAMETER ThrottleDelayMs
     Milliseconds to pause between file operations to keep PC responsive. Default: 5.
+
+.EXAMPLE
+    # Test MTP connection by scanning and listing files:
+    .\CopyNewFilesFromMTP.ps1 `
+        -DeviceName "Galaxy S24" `
+        -SourcePath "Internal storage\DCIM" `
+        -ScanOnly
 
 .EXAMPLE
     .\CopyNewFilesFromMTP.ps1 `
@@ -65,12 +77,10 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$SourcePath,
 
-    [Parameter(Mandatory = $true)]
-    [string[]]$BackupFolders,
+    [string[]]$BackupFolders = @(),
+    [string]$TargetFolder = "",
 
-    [Parameter(Mandatory = $true)]
-    [string]$TargetFolder,
-
+    [switch]$ScanOnly,
     [string]$IndexFile = "",
     [string]$StateFile = "",
     [string]$ScanCacheFile = "",
@@ -82,11 +92,24 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# ─── Validate parameters ───────────────────────────────────────────────────────
+
+if (-not $ScanOnly) {
+    if (-not $TargetFolder) {
+        throw "-TargetFolder is required unless -ScanOnly is specified."
+    }
+    if ($BackupFolders.Count -eq 0) {
+        throw "-BackupFolders is required unless -ScanOnly is specified."
+    }
+}
+
 # ─── Defaults ───────────────────────────────────────────────────────────────────
 
-if (-not $IndexFile)     { $IndexFile     = Join-Path $TargetFolder "_file_index.tsv" }
-if (-not $StateFile)     { $StateFile     = Join-Path $TargetFolder "_resume_state.txt" }
-if (-not $ScanCacheFile) { $ScanCacheFile = Join-Path $TargetFolder "_mtp_scan_cache.tsv" }
+if (-not $ScanOnly) {
+    if (-not $IndexFile)     { $IndexFile     = Join-Path $TargetFolder "_file_index.tsv" }
+    if (-not $StateFile)     { $StateFile     = Join-Path $TargetFolder "_resume_state.txt" }
+    if (-not $ScanCacheFile) { $ScanCacheFile = Join-Path $TargetFolder "_mtp_scan_cache.tsv" }
+}
 
 # ─── Lower process priority so the PC stays responsive ─────────────────────────
 
@@ -95,9 +118,11 @@ Write-Host "[INFO] Process priority set to BelowNormal for background-friendly o
 
 # ─── Ensure target folder exists ────────────────────────────────────────────────
 
-if (-not (Test-Path $TargetFolder)) {
-    New-Item -ItemType Directory -Path $TargetFolder -Force | Out-Null
-    Write-Host "[INFO] Created target folder: $TargetFolder" -ForegroundColor Cyan
+if (-not $ScanOnly) {
+    if (-not (Test-Path $TargetFolder)) {
+        New-Item -ItemType Directory -Path $TargetFolder -Force | Out-Null
+        Write-Host "[INFO] Created target folder: $TargetFolder" -ForegroundColor Cyan
+    }
 }
 
 # ─── PowerShell STA check ──────────────────────────────────────────────────────
@@ -193,46 +218,48 @@ function Load-FileIndex {
     return @{ Index = $index; Paths = $indexPaths }
 }
 
-# Check if index needs to be built
-if ($RebuildIndex -or -not (Test-Path $IndexFile)) {
-    Build-FileIndex -Folders $BackupFolders -OutputFile $IndexFile
-}
-else {
-    Write-Host ""
-    Write-Host "[INDEX] File index already exists: $IndexFile" -ForegroundColor Cyan
-    Write-Host "[INDEX] Use -RebuildIndex to force rebuild." -ForegroundColor Cyan
-}
+if (-not $ScanOnly) {
+    # Check if index needs to be built
+    if ($RebuildIndex -or -not (Test-Path $IndexFile)) {
+        Build-FileIndex -Folders $BackupFolders -OutputFile $IndexFile
+    }
+    else {
+        Write-Host ""
+        Write-Host "[INDEX] File index already exists: $IndexFile" -ForegroundColor Cyan
+        Write-Host "[INDEX] Use -RebuildIndex to force rebuild." -ForegroundColor Cyan
+    }
 
-$indexData = Load-FileIndex -IndexPath $IndexFile
-$fileIndex = $indexData.Index
-$fileIndexPaths = $indexData.Paths
+    $indexData = Load-FileIndex -IndexPath $IndexFile
+    $fileIndex = $indexData.Index
+    $fileIndexPaths = $indexData.Paths
 
-# Also index files already in the target folder (from previous runs)
-if (Test-Path $TargetFolder) {
-    Write-Host "[INDEX] Indexing target folder for already-copied files..." -ForegroundColor Cyan
-    $targetCount = 0
-    try {
-        $enumOptions = [System.IO.EnumerationOptions]::new()
-        $enumOptions.RecurseSubdirectories = $true
-        $enumOptions.IgnoreInaccessible = $true
+    # Also index files already in the target folder (from previous runs)
+    if (Test-Path $TargetFolder) {
+        Write-Host "[INDEX] Indexing target folder for already-copied files..." -ForegroundColor Cyan
+        $targetCount = 0
+        try {
+            $enumOptions = [System.IO.EnumerationOptions]::new()
+            $enumOptions.RecurseSubdirectories = $true
+            $enumOptions.IgnoreInaccessible = $true
 
-        foreach ($fi in [System.IO.DirectoryInfo]::new($TargetFolder).EnumerateFiles("*", $enumOptions)) {
-            # Skip our metadata files
-            if ($fi.Name.StartsWith("_file_index") -or $fi.Name.StartsWith("_resume_state") -or $fi.Name.StartsWith("_mtp_scan")) {
-                continue
-            }
-            $key = "$($fi.Name)|$($fi.Length)"
-            if ($fileIndex.Add($key)) {
-                $fileIndexPaths[$key] = $fi.FullName
-                $targetCount++
+            foreach ($fi in [System.IO.DirectoryInfo]::new($TargetFolder).EnumerateFiles("*", $enumOptions)) {
+                # Skip our metadata files
+                if ($fi.Name.StartsWith("_file_index") -or $fi.Name.StartsWith("_resume_state") -or $fi.Name.StartsWith("_mtp_scan")) {
+                    continue
+                }
+                $key = "$($fi.Name)|$($fi.Length)"
+                if ($fileIndex.Add($key)) {
+                    $fileIndexPaths[$key] = $fi.FullName
+                    $targetCount++
+                }
             }
         }
-    }
-    catch {
-        Write-Warning "Error scanning target folder: $_"
-    }
-    if ($targetCount -gt 0) {
-        Write-Host "[INDEX] Found $targetCount additional files already in target folder." -ForegroundColor Green
+        catch {
+            Write-Warning "Error scanning target folder: $_"
+        }
+        if ($targetCount -gt 0) {
+            Write-Host "[INDEX] Found $targetCount additional files already in target folder." -ForegroundColor Green
+        }
     }
 }
 
@@ -382,7 +409,97 @@ function Scan-MTPFolderRecursive {
     }
 }
 
-# Scan or load cache
+# ─── ScanOnly mode: scan MTP device, display results, and exit ──────────────
+
+if ($ScanOnly) {
+    Write-Host ""
+    Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Yellow
+    Write-Host " SCAN ONLY: Listing files on MTP device"                      -ForegroundColor Yellow
+    Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Yellow
+
+    Write-Host "[MTP] Looking for device: $DeviceName" -ForegroundColor Cyan
+    $device = Get-MTPDevice -Name $DeviceName
+    Write-Host "[MTP] Connected to: $($device.Name)" -ForegroundColor Green
+
+    Write-Host "[MTP] Navigating to: $SourcePath" -ForegroundColor Cyan
+    $sourceFolder = Navigate-MTPPath -DeviceItem $device -Path $SourcePath
+    Write-Host "[MTP] Source folder opened successfully." -ForegroundColor Green
+    Write-Host ""
+
+    # Scan into memory and display each file as it's found
+    $scanCount = [ref]0
+    $totalSize = [ref]0L
+
+    function Scan-MTPAndDisplay {
+        param(
+            [System.__ComObject]$Folder,
+            [string]$RelativePath,
+            [ref]$Counter,
+            [ref]$TotalSize
+        )
+
+        try { $items = $Folder.Items() }
+        catch {
+            Write-Warning "Cannot enumerate: $RelativePath - $_"
+            return
+        }
+
+        foreach ($item in $items) {
+            if ($item.IsFolder) {
+                $subPath = if ($RelativePath) { "$RelativePath\$($item.Name)" } else { $item.Name }
+                try {
+                    $subFolder = $item.GetFolder
+                    Scan-MTPAndDisplay -Folder $subFolder -RelativePath $subPath -Counter $Counter -TotalSize $TotalSize
+                }
+                catch {
+                    Write-Warning "Cannot access folder: $subPath - $_"
+                }
+            }
+            else {
+                $size = Get-MTPFileSize -Item $item -ParentFolder $Folder
+                $filePath = if ($RelativePath) { "$RelativePath\$($item.Name)" } else { $item.Name }
+                $Counter.Value++
+                if ($size -ge 0) { $TotalSize.Value += $size }
+
+                # Format size for display
+                $sizeDisplay = if ($size -lt 0) { "unknown" }
+                    elseif ($size -lt 1024) { "$size B" }
+                    elseif ($size -lt 1048576) { "$([math]::Round($size / 1024, 1)) KB" }
+                    elseif ($size -lt 1073741824) { "$([math]::Round($size / 1048576, 1)) MB" }
+                    else { "$([math]::Round($size / 1073741824, 2)) GB" }
+
+                Write-Host "  [$($Counter.Value)] $filePath  ($sizeDisplay)" -ForegroundColor Gray
+
+                if ($Counter.Value % 500 -eq 0) {
+                    Start-Sleep -Milliseconds 1
+                }
+            }
+        }
+    }
+
+    Write-Host "[MTP] Scanning all files recursively..." -ForegroundColor Cyan
+    Write-Host ""
+    $scanStart = Get-Date
+    Scan-MTPAndDisplay -Folder $sourceFolder -RelativePath "" -Counter $scanCount -TotalSize $totalSize
+    $scanDuration = (Get-Date) - $scanStart
+
+    # Format total size
+    $ts = $totalSize.Value
+    $totalDisplay = if ($ts -lt 1073741824) { "$([math]::Round($ts / 1048576, 1)) MB" }
+        else { "$([math]::Round($ts / 1073741824, 2)) GB" }
+
+    Write-Host ""
+    Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host " SCAN COMPLETE"                                                -ForegroundColor Green
+    Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host "  Total files: $($scanCount.Value)"       -ForegroundColor Cyan
+    Write-Host "  Total size:  $totalDisplay"              -ForegroundColor Cyan
+    Write-Host "  Scan time:   $($scanDuration.ToString('hh\:mm\:ss'))" -ForegroundColor Cyan
+    exit 0
+}
+
+# ─── Normal mode: Scan or load cache ────────────────────────────────────────
+
 $mtpFiles = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 if (-not $Rescan -and (Test-Path $ScanCacheFile)) {
