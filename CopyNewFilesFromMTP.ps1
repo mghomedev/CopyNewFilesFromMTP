@@ -74,11 +74,8 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$DeviceName,
-
-    [Parameter(Mandatory = $true)]
-    [string]$SourcePath,
+    [string]$DeviceName = "",
+    [string]$SourcePath = "",
 
     [string[]]$IgnoreFilesInFoldersBySizeAndName = @(),
     [string]$TargetFolder = "",
@@ -95,7 +92,62 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# ─── Version info ──────────────────────────────────────────────────────────────
+
+$script:AppVersion   = "1.1.0"
+$script:AppBuildDate = "2026-04-03"
+
+# ─── Show help if no arguments ─────────────────────────────────────────────────
+
+if (-not $DeviceName -and -not $SourcePath -and -not $ScanOnly) {
+    Write-Host ""
+    Write-Host "  CopyNewFilesFromMTP  v$($script:AppVersion)  (built $($script:AppBuildDate))" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Copies files from an MTP-connected Android phone to a Windows PC," -ForegroundColor White
+    Write-Host "  skipping files that already exist in specified backup locations." -ForegroundColor White
+    Write-Host ""
+    Write-Host "  Features:" -ForegroundColor Yellow
+    Write-Host "    - Deduplication by filename + file size against existing backup folders"
+    Write-Host "    - Resume support: unplug your phone, come back later, re-run"
+    Write-Host "    - Progress reporting with ETA"
+    Write-Host "    - Low system impact (runs at BelowNormal priority)"
+    Write-Host "    - MTP scan caching for fast resume"
+    Write-Host ""
+    Write-Host "  Usage:" -ForegroundColor Yellow
+    Write-Host "    Test MTP connection (scan only):" -ForegroundColor Gray
+    Write-Host '    .\CopyNewFilesFromMTP.ps1 -DeviceName "Galaxy S24" -SourcePath "Internal storage\DCIM" -ScanOnly'
+    Write-Host ""
+    Write-Host "    Copy new files:" -ForegroundColor Gray
+    Write-Host '    .\CopyNewFilesFromMTP.ps1 -DeviceName "Galaxy S24" -SourcePath "Internal storage\DCIM" \'
+    Write-Host '      -IgnoreFilesInFoldersBySizeAndName "D:\Backup\Phone2024" -TargetFolder "D:\Backup\Phone2025"'
+    Write-Host ""
+    Write-Host "    Copy with multiple ignore folders:" -ForegroundColor Gray
+    Write-Host '    .\CopyNewFilesFromMTP.ps1 -DeviceName "Galaxy S24" -SourcePath "Internal storage\DCIM" \'
+    Write-Host '      -IgnoreFilesInFoldersBySizeAndName @("D:\Backup\2023","D:\Backup\2024") -TargetFolder "D:\Backup\2025"'
+    Write-Host ""
+    Write-Host "  Parameters:" -ForegroundColor Yellow
+    Write-Host "    -DeviceName          MTP device name as shown in Windows Explorer"
+    Write-Host "    -SourcePath          Path on device (e.g. 'Internal storage\DCIM')"
+    Write-Host "    -IgnoreFilesInFoldersBySizeAndName  Folder(s) to check for existing files"
+    Write-Host "    -TargetFolder        Where to copy new files to"
+    Write-Host "    -ScanOnly            Only list device files, don't copy"
+    Write-Host "    -RebuildIndex        Force rebuild of the ignore index"
+    Write-Host "    -Rescan              Force rescan of the MTP device"
+    Write-Host "    -ThrottleDelayMs     Delay between operations in ms (default: 5)"
+    Write-Host ""
+    Write-Host "  https://github.com/mghomedev/CopyNewFilesFromMTP" -ForegroundColor DarkGray
+    Write-Host ""
+    exit 0
+}
+
 # ─── Validate parameters ───────────────────────────────────────────────────────
+
+if (-not $DeviceName) {
+    throw "-DeviceName is required. Run without arguments to see usage."
+}
+if (-not $SourcePath) {
+    throw "-SourcePath is required. Run without arguments to see usage."
+}
 
 if (-not $ScanOnly) {
     if (-not $TargetFolder) {

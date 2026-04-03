@@ -20,6 +20,16 @@ jobs:
         run: |
           Install-Module -Name ps2exe -Force -Scope CurrentUser
 
+      - name: Stamp version and build date into script
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $buildDate = (Get-Date -Format "yyyy-MM-dd")
+          $content = Get-Content "CopyNewFilesFromMTP.ps1" -Raw
+          $content = $content -replace '(\$script:AppVersion\s*=\s*)"[^"]*"', "`$1`"$version`""
+          $content = $content -replace '(\$script:AppBuildDate\s*=\s*)"[^"]*"', "`$1`"$buildDate`""
+          Set-Content "CopyNewFilesFromMTP.ps1" -Value $content -Encoding UTF8
+
       - name: Build EXE
         shell: pwsh
         run: |
