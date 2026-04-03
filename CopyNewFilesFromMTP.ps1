@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Copies new files from an MTP-connected Android device to a backup folder,
     skipping files that already exist in specified backup locations.
@@ -17,8 +17,10 @@
     Path on the device to copy from (e.g., "Internal storage\DCIM").
     Use backslashes to separate path components.
 
-.PARAMETER BackupFolders
-    Array of existing local backup folder paths to index for deduplication.
+.PARAMETER IgnoreFilesInFoldersBySizeAndName
+    One or more existing local backup folder paths to index for deduplication.
+    Files found in these folders (matched by filename and size) will be skipped
+    during copy. Accepts a single path or an array of paths.
 
 .PARAMETER TargetFolder
     Destination folder where new files will be copied to.
@@ -35,7 +37,7 @@
 .PARAMETER ScanOnly
     Only scan the MTP device source folder and display all found files with sizes.
     Useful for testing if the MTP connection and path work correctly.
-    When used, -BackupFolders and -TargetFolder are not required.
+    When used, -IgnoreFilesInFoldersBySizeAndName and -TargetFolder are not required.
 
 .PARAMETER RebuildIndex
     Force rebuilding the local backup index even if it already exists.
@@ -54,18 +56,19 @@
         -ScanOnly
 
 .EXAMPLE
+    # Single ignore folder:
     .\CopyNewFilesFromMTP.ps1 `
         -DeviceName "Galaxy S24" `
         -SourcePath "Internal storage\DCIM" `
-        -BackupFolders @("D:\Backup\Phone2023", "D:\Backup\Phone2024") `
+        -IgnoreFilesInFoldersBySizeAndName "D:\Backup\Phone2024" `
         -TargetFolder "D:\Backup\Phone2025"
 
 .EXAMPLE
-    # Resume a previously interrupted operation (same parameters):
+    # Multiple ignore folders:
     .\CopyNewFilesFromMTP.ps1 `
         -DeviceName "Galaxy S24" `
         -SourcePath "Internal storage\DCIM" `
-        -BackupFolders @("D:\Backup\Phone2023", "D:\Backup\Phone2024") `
+        -IgnoreFilesInFoldersBySizeAndName @("D:\Backup\Phone2023", "D:\Backup\Phone2024") `
         -TargetFolder "D:\Backup\Phone2025"
 #>
 
@@ -77,7 +80,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$SourcePath,
 
-    [string[]]$BackupFolders = @(),
+    [string[]]$IgnoreFilesInFoldersBySizeAndName = @(),
     [string]$TargetFolder = "",
 
     [switch]$ScanOnly,
@@ -98,8 +101,8 @@ if (-not $ScanOnly) {
     if (-not $TargetFolder) {
         throw "-TargetFolder is required unless -ScanOnly is specified."
     }
-    if ($BackupFolders.Count -eq 0) {
-        throw "-BackupFolders is required unless -ScanOnly is specified."
+    if ($IgnoreFilesInFoldersBySizeAndName.Count -eq 0) {
+        throw "-IgnoreFilesInFoldersBySizeAndName is required unless -ScanOnly is specified. Pass one or more folder paths."
     }
 }
 
@@ -135,6 +138,20 @@ if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
 # STEP 1: Build or load the local backup file index
 # ═══════════════════════════════════════════════════════════════════════════════
 
+function Confirm-Continue {
+    param([string]$Message)
+
+    Write-Host ""
+    Write-Host "[WARNING] $Message" -ForegroundColor Red
+    Write-Host ""
+    $response = Read-Host "Do you want to continue anyway? (y/N)"
+    if ($response -notin @('y', 'Y', 'yes', 'Yes', 'YES')) {
+        Write-Host "Aborted by user." -ForegroundColor Yellow
+        exit 1
+    }
+    Write-Host ""
+}
+
 function Build-FileIndex {
     param(
         [string[]]$Folders,
@@ -145,6 +162,28 @@ function Build-FileIndex {
     Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Yellow
     Write-Host " STEP 1: Building file index from local backup folders"       -ForegroundColor Yellow
     Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Yellow
+
+    # Pre-check: warn about missing or empty folders before indexing
+    $problems = @()
+    foreach ($folder in $Folders) {
+        if (-not (Test-Path $folder)) {
+            $problems += "Folder does not exist: $folder"
+        }
+        else {
+            $firstFile = Get-ChildItem -LiteralPath $folder -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $firstFile) {
+                $problems += "Folder exists but contains no files: $folder"
+            }
+        }
+    }
+
+    if ($problems.Count -gt 0) {
+        Write-Host ""
+        foreach ($p in $problems) {
+            Write-Host "  ! $p" -ForegroundColor Red
+        }
+        Confirm-Continue -Message "One or more ignore folders are missing or empty. This means no files will be skipped during copy — everything from the device will be copied. Did you make a mistake?"
+    }
 
     $writer = [System.IO.StreamWriter]::new($OutputFile, $false, [System.Text.Encoding]::UTF8)
     $writer.WriteLine("FileName`tSize`tFullPath")
@@ -160,14 +199,8 @@ function Build-FileIndex {
         $folderCount = 0
 
         try {
-            # Use .NET enumeration for maximum performance on large directories
-            $enumOptions = [System.IO.EnumerationOptions]::new()
-            $enumOptions.RecurseSubdirectories = $true
-            $enumOptions.IgnoreInaccessible = $true
-            $enumOptions.AttributesToSkip = [System.IO.FileAttributes]::System
-
-            foreach ($fi in [System.IO.DirectoryInfo]::new($folder).EnumerateFiles("*", $enumOptions)) {
-                $writer.WriteLine("$($fi.Name)`t$($fi.Length)`t$($fi.FullName)")
+            Get-ChildItem -LiteralPath $folder -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+                $writer.WriteLine("$($_.Name)`t$($_.Length)`t$($_.FullName)")
                 $folderCount++
                 $totalFiles++
 
@@ -186,6 +219,8 @@ function Build-FileIndex {
     $writer.Close()
     Write-Host "[INDEX] Total files indexed: $totalFiles" -ForegroundColor Green
     Write-Host "[INDEX] Index saved to: $OutputFile" -ForegroundColor Green
+
+    return $totalFiles
 }
 
 function Load-FileIndex {
@@ -205,7 +240,7 @@ function Load-FileIndex {
 
         $parts = $line.Split("`t", 3)
         if ($parts.Length -ge 2) {
-            $key = "$($parts[0])|$($parts[1])"
+            $key = $parts[0] + "|" + $parts[1]
             if ($index.Add($key)) {
                 if ($parts.Length -ge 3) {
                     $indexPaths[$key] = $parts[2]
@@ -221,7 +256,10 @@ function Load-FileIndex {
 if (-not $ScanOnly) {
     # Check if index needs to be built
     if ($RebuildIndex -or -not (Test-Path $IndexFile)) {
-        Build-FileIndex -Folders $BackupFolders -OutputFile $IndexFile
+        $builtCount = Build-FileIndex -Folders $IgnoreFilesInFoldersBySizeAndName -OutputFile $IndexFile
+        if ($builtCount -eq 0) {
+            Confirm-Continue -Message 'The generated ignore index is empty (0 files). This means no files will be skipped during copy - everything from the device will be copied. Did you make a mistake?'
+        }
     }
     else {
         Write-Host ""
@@ -233,23 +271,23 @@ if (-not $ScanOnly) {
     $fileIndex = $indexData.Index
     $fileIndexPaths = $indexData.Paths
 
+    if ($fileIndex.Count -eq 0) {
+        Confirm-Continue -Message 'The loaded ignore index is empty (0 files). This means no files will be skipped during copy - everything from the device will be copied. Did you make a mistake?'
+    }
+
     # Also index files already in the target folder (from previous runs)
     if (Test-Path $TargetFolder) {
         Write-Host "[INDEX] Indexing target folder for already-copied files..." -ForegroundColor Cyan
         $targetCount = 0
         try {
-            $enumOptions = [System.IO.EnumerationOptions]::new()
-            $enumOptions.RecurseSubdirectories = $true
-            $enumOptions.IgnoreInaccessible = $true
-
-            foreach ($fi in [System.IO.DirectoryInfo]::new($TargetFolder).EnumerateFiles("*", $enumOptions)) {
+            Get-ChildItem -LiteralPath $TargetFolder -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
                 # Skip our metadata files
-                if ($fi.Name.StartsWith("_file_index") -or $fi.Name.StartsWith("_resume_state") -or $fi.Name.StartsWith("_mtp_scan")) {
-                    continue
+                if ($_.Name.StartsWith("_file_index") -or $_.Name.StartsWith("_resume_state") -or $_.Name.StartsWith("_mtp_scan")) {
+                    return
                 }
-                $key = "$($fi.Name)|$($fi.Length)"
+                $key = $_.Name + "|" + $_.Length
                 if ($fileIndex.Add($key)) {
-                    $fileIndexPaths[$key] = $fi.FullName
+                    $fileIndexPaths[$key] = $_.FullName
                     $targetCount++
                 }
             }
@@ -707,7 +745,7 @@ foreach ($file in $toProcess) {
     $progressPrefix = "[$processedCount/$remaining | Left: $remainingNow | ETA: $etaStr]"
 
     # Check if file exists in local index
-    $lookupKey = "$($file.FileName)|$($file.Size)"
+    $lookupKey = $file.FileName + "|" + $file.Size
 
     if ($fileIndex.Contains($lookupKey)) {
         # File already exists in backup
