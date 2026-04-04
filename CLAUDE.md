@@ -71,6 +71,15 @@ PowerShell script that copies files from an MTP-connected Android phone to a Win
 - If the copy is interrupted, the `~.tmp` file is cleaned up before retrying
 - This prevents broken/incomplete files from appearing in the backup or being synced to cloud
 
+### Resume / Fresh Start Prompt
+- When state files (index, scan cache, resume state) exist from a previous run, the user is asked whether to continue or start fresh
+- Configurable via `-ResumeMode` (default: Ask):
+  - `Ask`: prompt the user interactively (C to continue, F for fresh)
+  - `Continue`: automatically resume without asking
+  - `Fresh`: automatically clear all state files and start from scratch
+- "Start fresh" deletes: file index, MTP scan cache, resume state, and any leftover `~*.tmp` files in the target
+- The default for Continue is pressing Enter (no input needed)
+
 ### Scan-Only Mode
 - `-ScanOnly` flag: only connect to MTP device, scan the source folder, list all files with sizes, and exit
 - Does not require `-IgnoreFilesInFoldersBySizeAndName` or `-TargetFolder`

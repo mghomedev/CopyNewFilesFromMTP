@@ -62,6 +62,12 @@
     - Skip:        Automatically skip the file and continue with the next one
     - WaitForever: Keep retrying indefinitely until the device comes back
 
+.PARAMETER ResumeMode
+    What to do when state files from a previous run exist. Default: Ask.
+    - Ask:      Prompt the user to continue or start fresh
+    - Continue: Automatically resume from the last state
+    - Fresh:    Clear all state files and start from scratch
+
 .EXAMPLE
     # Test MTP connection by scanning and listing files:
     .\CopyNewFilesFromMTP.ps1 `
@@ -105,7 +111,10 @@ param(
     [int]$RetryWaitSeconds = 10,
 
     [ValidateSet("Ask", "Skip", "WaitForever")]
-    [string]$OnFinalFailure = "WaitForever"
+    [string]$OnFinalFailure = "WaitForever",
+
+    [ValidateSet("Ask", "Continue", "Fresh")]
+    [string]$ResumeMode = "Ask"
 )
 
 Set-StrictMode -Version Latest
@@ -113,7 +122,7 @@ $ErrorActionPreference = "Stop"
 
 # ─── Version info ──────────────────────────────────────────────────────────────
 
-$script:AppVersion   = "1.2.4"
+$script:AppVersion   = "1.3.0"
 $script:AppBuildDate = "2026-04-04"
 
 # ─── Show help if no arguments ─────────────────────────────────────────────────
@@ -156,6 +165,7 @@ if (-not $DeviceName -and -not $SourcePath -and -not $ScanOnly) {
     Write-Host "    -RetryCount          Max retries when device disconnects (default: 30)"
     Write-Host "    -RetryWaitSeconds    Seconds between retries, doubles each time (default: 10)"
     Write-Host "    -OnFinalFailure      After all retries: Ask, Skip, or WaitForever (default: WaitForever)"
+    Write-Host "    -ResumeMode          On existing state: Ask, Continue, or Fresh (default: Ask)"
     Write-Host ""
     Write-Host "  https://github.com/mghomedev/CopyNewFilesFromMTP" -ForegroundColor DarkGray
     Write-Host ""
@@ -199,6 +209,70 @@ if (-not $ScanOnly) {
     if (-not (Test-Path $TargetFolder)) {
         New-Item -ItemType Directory -Path $TargetFolder -Force | Out-Null
         Write-Host "[INFO] Created target folder: $TargetFolder" -ForegroundColor Cyan
+    }
+}
+
+# ─── Check for existing state and ask to resume or start fresh ─────────────────
+
+if (-not $ScanOnly) {
+    $hasIndex = $IndexFile -and (Test-Path $IndexFile)
+    $hasState = $StateFile -and (Test-Path $StateFile)
+    $hasScanCache = $ScanCacheFile -and (Test-Path $ScanCacheFile)
+    $hasAnyState = $hasIndex -or $hasState -or $hasScanCache
+
+    if ($hasAnyState) {
+        $stateDetails = @()
+        if ($hasIndex)     { $stateDetails += "file index" }
+        if ($hasScanCache) { $stateDetails += "MTP scan cache" }
+        if ($hasState)     { $stateDetails += "resume state" }
+        $stateList = $stateDetails -join ", "
+
+        $startFresh = $false
+
+        switch ($ResumeMode) {
+            "Continue" {
+                Write-Host "[RESUME] Found previous state ($stateList). Continuing from last run." -ForegroundColor Cyan
+            }
+            "Fresh" {
+                $startFresh = $true
+            }
+            default {
+                # Ask the user
+                Write-Host ""
+                Write-Host "[RESUME] Found previous state from an earlier run:" -ForegroundColor Yellow
+                if ($hasIndex)     { Write-Host "  - File index:     $IndexFile" -ForegroundColor Gray }
+                if ($hasScanCache) { Write-Host "  - MTP scan cache: $ScanCacheFile" -ForegroundColor Gray }
+                if ($hasState)     { Write-Host "  - Resume state:   $StateFile" -ForegroundColor Gray }
+                Write-Host ""
+                $response = Read-Host "  (C)ontinue from where you left off, or start (F)resh? [C/f]"
+                if ($response -in @('f', 'F', 'fresh', 'Fresh', 'FRESH')) {
+                    $startFresh = $true
+                }
+                else {
+                    Write-Host "[RESUME] Continuing from last run." -ForegroundColor Cyan
+                }
+            }
+        }
+
+        if ($startFresh) {
+            Write-Host "[FRESH] Clearing all state files..." -ForegroundColor Yellow
+            if ($hasIndex)     { Remove-Item -LiteralPath $IndexFile -Force; Write-Host "  Deleted: $IndexFile" -ForegroundColor DarkGray }
+            if ($hasScanCache) { Remove-Item -LiteralPath $ScanCacheFile -Force; Write-Host "  Deleted: $ScanCacheFile" -ForegroundColor DarkGray }
+            if ($hasState)     { Remove-Item -LiteralPath $StateFile -Force; Write-Host "  Deleted: $StateFile" -ForegroundColor DarkGray }
+
+            # Also clean up any leftover ~*.tmp files in the target
+            Get-ChildItem -LiteralPath $TargetFolder -Recurse -File -Filter "~*.tmp" -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                $_.Attributes = $_.Attributes -band (-bnot ([System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::Temporary))
+                Remove-Item -LiteralPath $_.FullName -Force
+                Write-Host "  Deleted temp file: $($_.FullName)" -ForegroundColor DarkGray
+            }
+
+            Write-Host "[FRESH] Starting from scratch." -ForegroundColor Green
+            # Force rebuild/rescan
+            $RebuildIndex = $true
+            $Rescan = $true
+        }
+        Write-Host ""
     }
 }
 

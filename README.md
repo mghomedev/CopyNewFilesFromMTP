@@ -111,6 +111,7 @@ Just run the exact same command again. The script detects the state file and sca
 | `-RetryCount` | No | Max retries when device disconnects (default: 30) |
 | `-RetryWaitSeconds` | No | Initial seconds between retries, doubles each time (default: 10) |
 | `-OnFinalFailure` | No | After all retries: `Ask`, `Skip`, or `WaitForever` (default: `WaitForever`) |
+| `-ResumeMode` | No | On existing state: `Ask`, `Continue`, or `Fresh` (default: `Ask`) |
 
 ## How it works
 
