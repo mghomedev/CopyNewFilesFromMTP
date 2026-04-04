@@ -92,6 +92,22 @@ PowerShell script that copies files from an MTP-connected Android phone to a Win
 - **On every code change, increment at least the patch (last) digit of the version**
 - The GitHub Actions release workflow stamps the tag version and current date into the script before building the EXE
 
+## Timing Configuration
+
+All timing values are defined as `$script:` variables in a single block near the top of the script (after version info). This is the single source of truth — do NOT hard-code timing values elsewhere.
+
+| Variable | Default | Description |
+|---|---|---|
+| `CopyPollMs` | 50 | How often to check if a file has appeared/finished copying (ms) |
+| `CopyProgressMs` | 500 | How often to update the spinner/percentage on screen (ms) |
+| `CopyTimeoutMinutes` | 30 | Max time to wait for a single file copy before giving up |
+| `StabilityCheckMs` | 200 | For unknown-size files: pause before re-checking if size stopped growing |
+| `RetryBackoffMaxSeconds` | 600 | Cap for exponential backoff between retries (10 minutes) |
+| `ScanYieldInterval` | 500 | Yield CPU every N files during MTP scan |
+| `ScanYieldMs` | 1 | Duration of each yield pause during scan (ms) |
+
+Retry wait times (`-RetryWaitSeconds`, `-RetryCount`) are command-line parameters, not in this block.
+
 ## Technical Constraints
 
 ### PowerShell 5.1 Compatibility

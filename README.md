@@ -107,11 +107,24 @@ Just run the exact same command again. The script detects the state file and sca
 | `-IndexFile` | No | Custom path for the index file |
 | `-StateFile` | No | Custom path for the resume state file |
 | `-ScanCacheFile` | No | Custom path for the MTP scan cache |
-| `-ThrottleDelayMs` | No | Delay between operations in ms (default: 5) |
 | `-RetryCount` | No | Max retries when device disconnects (default: 30) |
 | `-RetryWaitSeconds` | No | Initial seconds between retries, doubles each time (default: 10) |
 | `-OnFinalFailure` | No | After all retries: `Ask`, `Skip`, or `WaitForever` (default: `WaitForever`) |
 | `-ResumeMode` | No | On existing state: `Ask`, `Continue`, or `Fresh` (default: `Ask`) |
+
+### Timing Configuration
+
+Internal timing values can be adjusted by editing the `$script:` variables at the top of the `.ps1` script:
+
+| Variable | Default | Description |
+|---|---|---|
+| `CopyPollMs` | 50 | How often to check if a file has appeared/finished copying (ms) |
+| `CopyProgressMs` | 500 | How often to update the spinner/percentage on screen (ms) |
+| `CopyTimeoutMinutes` | 30 | Max time to wait for a single file copy before giving up |
+| `StabilityCheckMs` | 200 | For unknown-size files: pause before re-checking if size stopped growing |
+| `RetryBackoffMaxSeconds` | 600 | Cap for exponential backoff between retries (10 minutes) |
+| `ScanYieldInterval` | 500 | Yield CPU every N files during MTP scan |
+| `ScanYieldMs` | 1 | Duration of each yield pause during scan (ms) |
 
 ## How it works
 
@@ -150,7 +163,7 @@ The script creates these metadata files in the target folder (prefixed with `_`)
 - **Execution Policy**: Windows may block PowerShell scripts by default. Use `powershell.exe -ExecutionPolicy Bypass -File ...` to run without changing system settings.
 - **Device name**: The device name must match what Windows Explorer shows under "This PC". If the name is wrong, the script lists all available devices.
 - **Path on device**: The path uses backslashes (e.g., `"Internal storage\DCIM"`). If a segment is not found, the script lists available items at that level so you can discover the correct path.
-- **MTP performance**: MTP is inherently slower than direct file system access. Scanning 28,000+ files takes about 40 seconds; copying depends on file sizes and USB speed.
+- **MTP performance**: MTP (Media Transfer Protocol) is significantly slower than direct file system access, especially for many small files. Each file transfer involves a per-file protocol overhead of roughly 1-2 seconds for session negotiation, object handle allocation, and metadata exchange — regardless of the file's actual size. This means a 2 MB photo and an 8 MB photo may take a similar amount of time to transfer, because the overhead dominates the actual data transfer. This is a fundamental limitation of the MTP protocol and cannot be fixed in software. For background on MTP's design and performance characteristics, see the [USB.org MTP specification](https://www.usb.org/document-library/media-transfer-protocol-v11-spec-and-mtp-v11-adopters-agreement) and [Android's MTP documentation](https://source.android.com/docs/core/connect/mtp). Scanning 28,000+ files takes about 40 seconds; copying throughput depends on file sizes and USB speed, but expect 3-15 MB/s effective throughput per file due to the per-file overhead.
 
 ## License
 
