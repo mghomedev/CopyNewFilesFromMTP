@@ -26,13 +26,22 @@
     Destination folder where new files will be copied to.
 
 .PARAMETER IndexFile
-    Path to the file index. Default: <TargetFolder>\_file_index.tsv
+    Path to the local backup file index (tab-separated: filename, size, full path).
+    Contains all files found in the -IgnoreFilesInFoldersBySizeAndName folders, used
+    for fast O(1) deduplication lookups during copy.
+    Default: <TargetFolder>\_cache_CopyNewFilesFromMTP_local_backup_file_index.tsv
 
 .PARAMETER StateFile
-    Path to the resume state file. Default: <TargetFolder>\_resume_state.txt
+    Path to the resume progress file (one processed file path per line).
+    Tracks which MTP files have already been copied or skipped, so the script
+    can resume after interruption without reprocessing completed files.
+    Default: <TargetFolder>\_cache_CopyNewFilesFromMTP_resume_progress.txt
 
 .PARAMETER ScanCacheFile
-    Path to cache the MTP device scan. Default: <TargetFolder>\_mtp_scan_cache.tsv
+    Path to the MTP device file list cache (tab-separated: relative path, size).
+    Contains all files found during the MTP device scan, so the phone does not
+    need to be re-scanned on resume.
+    Default: <TargetFolder>\_cache_CopyNewFilesFromMTP_mtp_device_file_list.tsv
 
 .PARAMETER ScanOnly
     Only scan the MTP device source folder and display all found files with sizes.
@@ -114,7 +123,11 @@ param(
     [string]$OnFinalFailure = "WaitForever",
 
     [ValidateSet("Ask", "Continue", "Fresh")]
-    [string]$ResumeMode = "Ask"
+    [string]$ResumeMode = "Ask",
+
+    [switch]$CloudSyncSafe,
+    [int]$MaxCopyCount = 0,
+    [switch]$Benchmark
 )
 
 Set-StrictMode -Version Latest
@@ -122,7 +135,7 @@ $ErrorActionPreference = "Stop"
 
 # ─── Version info ──────────────────────────────────────────────────────────────
 
-$script:AppVersion   = "1.3.6"
+$script:AppVersion   = "1.5.0"
 $script:AppBuildDate = "2026-04-04"
 
 # ─── Timing configuration (all in one place) ──────────────────────────────────
@@ -189,6 +202,17 @@ if (-not $DeviceName -and -not $SourcePath -and -not $ScanOnly) {
     Write-Host "    -RetryWaitSeconds    Seconds between retries, doubles each time (default: 10)"
     Write-Host "    -OnFinalFailure      After all retries: Ask, Skip, or WaitForever (default: WaitForever)"
     Write-Host "    -ResumeMode          On existing state: Ask, Continue, or Fresh (default: Ask)"
+    Write-Host "    -CloudSyncSafe       Rename files during copy to prevent Dropbox/OneDrive upload"
+    Write-Host "    -MaxCopyCount        Stop after copying this many files (0 = unlimited, default: 0)"
+    Write-Host "    -Benchmark           Output detailed per-statement timing for performance analysis"
+    Write-Host ""
+    Write-Host "  Cache files (created in -TargetFolder):" -ForegroundColor Yellow
+    Write-Host "    _cache_CopyNewFilesFromMTP_local_backup_file_index.tsv"
+    Write-Host "      Index of all files in -IgnoreFilesInFoldersBySizeAndName folders (for dedup)"
+    Write-Host "    _cache_CopyNewFilesFromMTP_mtp_device_file_list.tsv"
+    Write-Host "      Cached list of all files on the MTP device (avoids re-scanning on resume)"
+    Write-Host "    _cache_CopyNewFilesFromMTP_resume_progress.txt"
+    Write-Host "      Tracks which files have been processed (for resume after interruption)"
     Write-Host ""
     Write-Host "  https://github.com/mghomedev/CopyNewFilesFromMTP" -ForegroundColor DarkGray
     Write-Host ""
@@ -216,9 +240,9 @@ if (-not $ScanOnly) {
 # ─── Defaults ───────────────────────────────────────────────────────────────────
 
 if (-not $ScanOnly) {
-    if (-not $IndexFile)     { $IndexFile     = Join-Path $TargetFolder "_file_index.tsv" }
-    if (-not $StateFile)     { $StateFile     = Join-Path $TargetFolder "_resume_state.txt" }
-    if (-not $ScanCacheFile) { $ScanCacheFile = Join-Path $TargetFolder "_mtp_scan_cache.tsv" }
+    if (-not $IndexFile)     { $IndexFile     = Join-Path $TargetFolder "_cache_CopyNewFilesFromMTP_local_backup_file_index.tsv" }
+    if (-not $StateFile)     { $StateFile     = Join-Path $TargetFolder "_cache_CopyNewFilesFromMTP_resume_progress.txt" }
+    if (-not $ScanCacheFile) { $ScanCacheFile = Join-Path $TargetFolder "_cache_CopyNewFilesFromMTP_mtp_device_file_list.tsv" }
 }
 
 # ─── Lower process priority so the PC stays responsive ─────────────────────────
@@ -498,7 +522,7 @@ if (-not $ScanOnly) {
         try {
             Get-ChildItem -LiteralPath $TargetFolder -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
                 # Skip our metadata files
-                if ($_.Name.StartsWith("_file_index") -or $_.Name.StartsWith("_resume_state") -or $_.Name.StartsWith("_mtp_scan")) {
+                if ($_.Name.StartsWith("_cache_CopyNewFilesFromMTP_")) {
                     return
                 }
                 $key = $_.Name + "|" + $_.Length
@@ -939,6 +963,7 @@ function Reconnect-MTP {
     # Invalidate folder caches
     $script:lastMtpParentPath = $null
     $script:lastMtpParentFolder = $null
+    $script:lastMtpFolderItems = @{}
     $script:lastTargetShellDir = $null
     $script:lastTargetShellFolder = $null
     $newShell = New-Object -ComObject Shell.Application
@@ -1076,33 +1101,7 @@ $script:spinnerPs = [powershell]::Create().AddScript({
             $i++
             $elapsedSec = ([System.Diagnostics.Stopwatch]::GetTimestamp() - $sync.StartTicks) / [System.Diagnostics.Stopwatch]::Frequency
             $elapsedDisplay = [math]::Round($elapsedSec)
-
-            # Try to read current file size for progress
-            $pctStr = ""
-            $speedStr = ""
-            try {
-                $tp = $sync.TargetPath
-                if ($tp -and [System.IO.File]::Exists($tp)) {
-                    $currentSize = ([System.IO.FileInfo]::new($tp)).Length
-                    $expected = $sync.FileSize
-                    if ($expected -gt 0 -and $currentSize -gt 0) {
-                        $pct = [math]::Min(100, [math]::Round(($currentSize / $expected) * 100))
-                        $pctStr = " ${pct}%"
-                    }
-                    if ($elapsedSec -gt 0.2 -and $currentSize -gt 0) {
-                        $mbps = [math]::Round(($currentSize / 1048576) / $elapsedSec, 1)
-                        $speedStr = " ${mbps} MB/s"
-                    }
-                }
-            }
-            catch {}
-
-            if (-not $pctStr -and $elapsedSec -gt 0.5) {
-                # No file progress available, show elapsed time
-                $pctStr = " ${elapsedDisplay}s"
-            }
-
-            [Console]::Write("`r$($sync.Prefix) COPYING: $($sync.FileName) ($($sync.SizeDisplay))${pctStr}${speedStr} $spin   ")
+            try { [Console]::Write("`r$($sync.Prefix) COPYING: $($sync.FileName) ($($sync.SizeDisplay)) ${elapsedDisplay}s $spin   ") } catch {}
         }
         [System.Threading.Thread]::Sleep($sync.ProgressMs)
     }
@@ -1123,6 +1122,7 @@ $startTime = Get-Date
 # Caches for MTP folder navigation and target shell folder (avoid re-navigating per file)
 $script:lastMtpParentPath = $null
 $script:lastMtpParentFolder = $null
+$script:lastMtpFolderItems = @{}
 $script:lastTargetShellDir = $null
 $script:lastTargetShellFolder = $null
 
@@ -1143,7 +1143,8 @@ foreach ($file in $toProcess) {
         $etaStr = "calculating..."
     }
 
-    $progressPrefix = "[$absolutePos/$totalOnDevice | Left: $remainingNow | ETA: $etaStr]"
+    $ts = [datetime]::Now.ToString("HH:mm:ss")
+    $progressPrefix = "[$ts $absolutePos/$totalOnDevice | Left: $remainingNow | ETA: $etaStr]"
 
     # Check if file exists in local index
     $lookupKey = $file.FileName + "|" + $file.Size
@@ -1180,179 +1181,227 @@ foreach ($file in $toProcess) {
             New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
         }
 
-        # Copy with retry support for MTP disconnections
-        # Strategy: CopyHere to target dir, immediately rename to ~filename.tmp with
-        # Temporary+Hidden attributes (Dropbox/OneDrive skip these), verify, then rename to final name.
-        $currentFile = $file
-        $currentTargetDir = $targetDir
-        $currentTargetFilePath = $targetFilePath
-        $tmpFileName = "~" + $file.FileName + ".tmp"
-        $tmpFilePath = Join-Path $targetDir $tmpFileName
-
-        # Clean up leftover ~.tmp from a previous failed attempt
-        if (Test-Path -LiteralPath $tmpFilePath) {
-            # Remove Hidden+Temporary attributes so we can delete
-            $fi = Get-Item -LiteralPath $tmpFilePath -Force
-            $fi.Attributes = $fi.Attributes -band (-bnot ([System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::Temporary))
-            Remove-Item -LiteralPath $tmpFilePath -Force -ErrorAction SilentlyContinue
-        }
-
         # Show message before copy starts
         $sizeDisplay = if ($file.Size -lt 0) { "unknown size" }
             elseif ($file.Size -lt 1024) { "$($file.Size) B" }
             elseif ($file.Size -lt 1048576) { "$([math]::Round($file.Size / 1024, 1)) KB" }
             elseif ($file.Size -lt 1073741824) { "$([math]::Round($file.Size / 1048576, 1)) MB" }
             else { "$([math]::Round($file.Size / 1073741824, 2)) GB" }
-        [Console]::Write("$progressPrefix COPYING: $($file.RelativePath) ($sizeDisplay) ...")
-        $fileCopyStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        Write-Host "$progressPrefix COPYING: $($file.RelativePath) ($sizeDisplay) ..." -NoNewline
 
-        $copyResult = Invoke-WithRetry -FileDescription $file.RelativePath -ProgressPrefix $progressPrefix -Operation {
-            # Clean up leftovers from a previous failed attempt
-            if (Test-Path -LiteralPath $tmpFilePath) {
-                [System.IO.File]::SetAttributes($tmpFilePath, [System.IO.FileAttributes]::Normal)
-                [System.IO.File]::Delete($tmpFilePath)
-            }
-            if (Test-Path -LiteralPath $currentTargetFilePath) {
-                [System.IO.File]::Delete($currentTargetFilePath)
-            }
+        # ── Inline copy with retry (no scriptblock overhead) ──────────────
+        $tmpFileName = "~" + $file.FileName + ".tmp"
+        $tmpFilePath = Join-Path $targetDir $tmpFileName
+        $retryAttempt = 0
+        $retryWait = $RetryWaitSeconds
+        $copiedSize = 0L
+        $copySuccess = $false
+        $copySkipped = $false
 
-            # Navigate to file on MTP device - use cached folder when possible
-            $relParts = $currentFile.RelativePath.Split('\')
-            $parentPath = ""
-            if ($relParts.Length -gt 1) {
-                $parentPath = ($relParts[0..($relParts.Length - 2)]) -join '\'
-            }
+        while (-not $copySuccess -and -not $copySkipped) {
+            try {
+                # On retry: clean up leftovers
+                if ($retryAttempt -gt 0) {
+                    foreach ($p in @($tmpFilePath, $targetFilePath)) {
+                        if ([System.IO.File]::Exists($p)) {
+                            try { [System.IO.File]::SetAttributes($p, [System.IO.FileAttributes]::Normal) } catch {}
+                            try { [System.IO.File]::Delete($p) } catch {}
+                        }
+                    }
+                }
 
-            if ($parentPath -ne $script:lastMtpParentPath) {
-                if ($parentPath -eq "") {
-                    $script:lastMtpParentFolder = $script:sourceFolder
+                # Navigate MTP and find file item (cached per-folder)
+                $bmSw = [System.Diagnostics.Stopwatch]::StartNew()
+                $relParts = $file.RelativePath.Split('\')
+                $parentPath = if ($relParts.Length -gt 1) { ($relParts[0..($relParts.Length - 2)]) -join '\' } else { "" }
+
+                if ($parentPath -ne $script:lastMtpParentPath) {
+                    # Navigate to folder
+                    if ($parentPath -eq "") {
+                        $script:lastMtpParentFolder = $script:sourceFolder
+                    }
+                    else {
+                        $nav = $script:sourceFolder
+                        for ($i = 0; $i -lt $relParts.Length - 1; $i++) {
+                            $child = $nav.ParseName($relParts[$i])
+                            if ($null -eq $child) { throw "MTP path not found: $parentPath" }
+                            $nav = $child.GetFolder
+                        }
+                        $script:lastMtpParentFolder = $nav
+                    }
+                    $script:lastMtpParentPath = $parentPath
+
+                    # Pre-enumerate ALL items in this folder into a dictionary for fast lookup.
+                    # MTP ParseName does a slow linear scan — this avoids calling it per file.
+                    $bmEnumSw = [System.Diagnostics.Stopwatch]::StartNew()
+                    $script:lastMtpFolderItems = @{}
+                    foreach ($mtpItem in $script:lastMtpParentFolder.Items()) {
+                        $script:lastMtpFolderItems[$mtpItem.Name] = $mtpItem
+                    }
+                    $bmEnumSw.Stop()
+                    Write-Host "  [Cached $($script:lastMtpFolderItems.Count) items from MTP folder: $parentPath in $($bmEnumSw.ElapsedMilliseconds)ms]" -ForegroundColor DarkGray
+                }
+
+                $fileName = $relParts[$relParts.Length - 1]
+                $fileItem = $script:lastMtpFolderItems[$fileName]
+                if ($null -eq $fileItem) { throw "File not found on device: $($file.RelativePath)" }
+                $bmSw.Stop(); $bmNav = $bmSw.ElapsedMilliseconds
+
+                # Cache target shell folder
+                $bmSw = [System.Diagnostics.Stopwatch]::StartNew()
+                if ($targetDir -ne $script:lastTargetShellDir) {
+                    $script:lastTargetShellFolder = $script:shell.NameSpace($targetDir)
+                    $script:lastTargetShellDir = $targetDir
+                }
+                if ($null -eq $script:lastTargetShellFolder) { throw "Cannot access target folder: $targetDir" }
+                $bmSw.Stop(); $bmTgt = $bmSw.ElapsedMilliseconds
+
+                # Start spinner, then CopyHere (blocks until MTP transfer is done)
+                $script:spinnerSync.Prefix = $progressPrefix
+                $script:spinnerSync.FileName = $file.RelativePath
+                $script:spinnerSync.SizeDisplay = $sizeDisplay
+                $script:spinnerSync.FileSize = $file.Size
+                $script:spinnerSync.TargetPath = $targetFilePath
+                $script:spinnerSync.StartTicks = [System.Diagnostics.Stopwatch]::GetTimestamp()
+                $script:spinnerSync.Active = $true
+                $fileCopyStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+                $script:lastTargetShellFolder.CopyHere($fileItem, 0x10)
+
+                $fileCopyStopwatch.Stop()
+                $script:spinnerSync.Active = $false
+                $bmCopy = $fileCopyStopwatch.ElapsedMilliseconds
+
+                # Verify file arrived (CopyHere is usually synchronous, but check)
+                $bmSw = [System.Diagnostics.Stopwatch]::StartNew()
+                if (-not [System.IO.File]::Exists($targetFilePath)) {
+                    $pollSw = [System.Diagnostics.Stopwatch]::StartNew()
+                    $script:spinnerSync.Active = $true
+                    while (-not [System.IO.File]::Exists($targetFilePath)) {
+                        if ($pollSw.Elapsed.TotalMinutes -gt $script:CopyTimeoutMinutes) {
+                            $script:spinnerSync.Active = $false
+                            throw "Timeout waiting for file"
+                        }
+                        [System.Threading.Thread]::Sleep($script:CopyPollMs)
+                    }
+                    $script:spinnerSync.Active = $false
+                }
+                $bmSw.Stop(); $bmVerify = $bmSw.ElapsedMilliseconds
+
+                # Clear spinner line
+                Write-Host "`r$(' ' * 160)`r" -NoNewline
+
+                # CopyHere is atomic: if the file exists, it's complete.
+                $copiedSize = $file.Size
+
+                if ($Benchmark) {
+                    Write-Host "  [BENCH nav:${bmNav}ms copy:${bmCopy}ms verify:${bmVerify}ms tgt:${bmTgt}ms total:$($bmNav+$bmCopy+$bmVerify+$bmTgt)ms]" -ForegroundColor DarkGray
+                }
+
+                $copySuccess = $true
+            }
+            catch {
+                $script:spinnerSync.Active = $false
+                Write-Host "`r$(' ' * 160)`r" -NoNewline
+                $retryAttempt++
+                $errorMsg = $_.ToString()
+
+                if ($retryAttempt -le $RetryCount) {
+                    Write-Host "$progressPrefix RETRY ($retryAttempt/$RetryCount): $($file.RelativePath)" -ForegroundColor Yellow
+                    Write-Host "  Error: $errorMsg" -ForegroundColor DarkGray
+
+                    # Try reconnect first - if successful, retry immediately
+                    try {
+                        $reconnect = Reconnect-MTP
+                        $script:shell = $reconnect.Shell
+                        $script:sourceFolder = $reconnect.SourceFolder
+                        $retryWait = $RetryWaitSeconds  # reset backoff
+                    }
+                    catch {
+                        Write-Host "$progressPrefix RETRY: Device not available, waiting ${retryWait}s..." -ForegroundColor DarkYellow
+                        Start-Sleep -Seconds $retryWait
+                        $retryWait = [math]::Min($retryWait * 2, $script:RetryBackoffMaxSeconds)
+                    }
                 }
                 else {
-                    $currentFolder = $script:sourceFolder
-                    for ($i = 0; $i -lt $relParts.Length - 1; $i++) {
-                        $child = $currentFolder.ParseName($relParts[$i])
-                        if ($null -eq $child) { throw "MTP path not found: $parentPath" }
-                        $currentFolder = $child.GetFolder
+                    # All retries exhausted
+                    switch ($OnFinalFailure) {
+                        "Skip" {
+                            Write-Host "$progressPrefix SKIP (retries exhausted): $($file.RelativePath)" -ForegroundColor Red
+                            $copySkipped = $true
+                        }
+                        "Ask" {
+                            :askLoop while ($true) {
+                                Write-Host ""
+                                Write-Host "$progressPrefix FAILED after $RetryCount retries: $($file.RelativePath)" -ForegroundColor Red
+                                Write-Host "  Error: $errorMsg" -ForegroundColor DarkGray
+                                $resp = Read-Host "  (S)kip this file, (R)etry again, or (W)ait forever?"
+                                switch ($resp.ToUpper()) {
+                                    "S" { $copySkipped = $true; break askLoop }
+                                    "R" { $retryAttempt = 0; $retryWait = $RetryWaitSeconds; break askLoop }
+                                    "W" { $retryAttempt = 0; $retryWait = $RetryWaitSeconds; break askLoop }
+                                    default { Write-Host "  Please enter S, R, or W" -ForegroundColor Gray }
+                                }
+                            }
+                        }
+                        default {
+                            # WaitForever
+                            Write-Host "$progressPrefix WAITING: Plug the phone back in... (Ctrl+C to abort)" -ForegroundColor Yellow
+                            $retryAttempt = 0
+                            $retryWait = $RetryWaitSeconds
+                            try {
+                                $reconnect = Reconnect-MTP
+                                $script:shell = $reconnect.Shell
+                                $script:sourceFolder = $reconnect.SourceFolder
+                            }
+                            catch {
+                                Write-Host "$progressPrefix WAITING: Device not available yet, waiting ${retryWait}s..." -ForegroundColor DarkYellow
+                                Start-Sleep -Seconds $retryWait
+                            }
+                        }
                     }
-                    $script:lastMtpParentFolder = $currentFolder
                 }
-                $script:lastMtpParentPath = $parentPath
             }
-
-            $fileItem = $script:lastMtpParentFolder.ParseName($relParts[$relParts.Length - 1])
-            if ($null -eq $fileItem) {
-                throw "File not found on device: $($currentFile.RelativePath)"
-            }
-
-            # Cache the target shell folder
-            if ($currentTargetDir -ne $script:lastTargetShellDir) {
-                $script:lastTargetShellFolder = $script:shell.NameSpace($currentTargetDir)
-                $script:lastTargetShellDir = $currentTargetDir
-            }
-            if ($null -eq $script:lastTargetShellFolder) {
-                throw "Cannot access target folder: $currentTargetDir"
-            }
-
-            # Activate background spinner (shows progress while CopyHere blocks)
-            $script:spinnerSync.Prefix = $progressPrefix
-            $script:spinnerSync.FileName = $currentFile.RelativePath
-            $script:spinnerSync.SizeDisplay = $sizeDisplay
-            $script:spinnerSync.FileSize = $currentFile.Size
-            $script:spinnerSync.TargetPath = $currentTargetFilePath
-            $script:spinnerSync.StartTicks = [System.Diagnostics.Stopwatch]::GetTimestamp()
-            $script:spinnerSync.Active = $true
-
-            # Copy using Shell COM (file appears with original name)
-            # CopyHere BLOCKS until the file is fully transferred via MTP.
-            # The background spinner thread updates the console during this time.
-            # Flags: 0x4 = no progress dialog, 0x10 = yes to all, 0x400 = no UI on error
-            $script:lastTargetShellFolder.CopyHere($fileItem, 0x414)
-
-            # Stop spinner
-            $script:spinnerSync.Active = $false
-
-            # CopyHere may be async on some systems - verify file exists with correct size
-            $expectedSize = $currentFile.Size
-            if (-not (Test-Path -LiteralPath $currentTargetFilePath)) {
-                # File not yet appeared - wait with polling
-                $pollSw = [System.Diagnostics.Stopwatch]::StartNew()
-                $script:spinnerSync.Active = $true
-                while (-not (Test-Path -LiteralPath $currentTargetFilePath)) {
-                    if ($pollSw.Elapsed.TotalMinutes -gt $script:CopyTimeoutMinutes) {
-                        $script:spinnerSync.Active = $false
-                        [Console]::WriteLine("")
-                        throw "Timeout waiting for file copy to start"
-                    }
-                    Start-Sleep -Milliseconds $script:CopyPollMs
-                }
-                # Wait for size to match
-                while ($expectedSize -gt 0) {
-                    $currentSize = ([System.IO.FileInfo]::new($currentTargetFilePath)).Length
-                    if ($currentSize -ge $expectedSize) { break }
-                    if ($pollSw.Elapsed.TotalMinutes -gt $script:CopyTimeoutMinutes) {
-                        $script:spinnerSync.Active = $false
-                        [Console]::WriteLine("")
-                        throw "Timeout waiting for file copy to complete"
-                    }
-                    Start-Sleep -Milliseconds $script:CopyPollMs
-                }
-                $script:spinnerSync.Active = $false
-            }
-
-            # Clear the progress line
-            [Console]::Write("`r" + (' ' * ([Console]::WindowWidth - 1)) + "`r")
-
-            # Rename to ~filename.tmp and set cloud-sync-ignore attributes
-            [System.IO.File]::Move($currentTargetFilePath, $tmpFilePath)
-            [System.IO.File]::SetAttributes($tmpFilePath, [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::Temporary)
-
-            # Verify size
-            $copiedSize = ([System.IO.FileInfo]::new($tmpFilePath)).Length
-            if ($currentFile.Size -ge 0 -and $copiedSize -ne $currentFile.Size) {
-                [System.IO.File]::SetAttributes($tmpFilePath, [System.IO.FileAttributes]::Normal)
-                [System.IO.File]::Delete($tmpFilePath)
-                throw "Copy incomplete: expected $($currentFile.Size) bytes but got $copiedSize bytes"
-            }
-
-            return @{ CopiedSize = $copiedSize }
         }
 
-        if ($null -eq $copyResult) {
-            # File was skipped after retries - clean up
-            if ([System.IO.File]::Exists($tmpFilePath)) {
-                [System.IO.File]::SetAttributes($tmpFilePath, [System.IO.FileAttributes]::Normal)
-                [System.IO.File]::Delete($tmpFilePath)
+        # Record result
+        if ($copySkipped) {
+            # Clean up any partial/temp files
+            foreach ($p in @($tmpFilePath, $targetFilePath)) {
+                if ([System.IO.File]::Exists($p)) {
+                    try { [System.IO.File]::SetAttributes($p, [System.IO.FileAttributes]::Normal) } catch {}
+                    try { [System.IO.File]::Delete($p) } catch {}
+                }
             }
             $errorCount++
             $stateWriter.WriteLine($file.RelativePath)
         }
-        else {
-            # Promote: clear attributes and rename to final name (atomic, same volume)
-            [System.IO.File]::SetAttributes($tmpFilePath, [System.IO.FileAttributes]::Normal)
-            if ([System.IO.File]::Exists($targetFilePath)) { [System.IO.File]::Delete($targetFilePath) }
-            [System.IO.File]::Move($tmpFilePath, $targetFilePath)
-
-            $fileCopyStopwatch.Stop()
-            $copiedSize = $copyResult.CopiedSize
-            $sizeMatch = if ($file.Size -ge 0) { $copiedSize -eq $file.Size } else { $true }
+        elseif ($copySuccess) {
             $fileSecs = $fileCopyStopwatch.Elapsed.TotalSeconds
             $fileMBs = if ($fileSecs -gt 0.01) { [math]::Round(($copiedSize / 1048576) / $fileSecs, 1) } else { 0 }
             $script:totalBytesCopied += $copiedSize
+            $sizeMatch = if ($file.Size -ge 0) { $copiedSize -eq $file.Size } else { $true }
 
+            $tsNow = [datetime]::Now.ToString("HH:mm:ss")
             if ($sizeMatch) {
-                Write-Host "$progressPrefix COPIED: $($file.RelativePath) ($([math]::Round($copiedSize / 1MB, 2)) MB) @ ${fileMBs} MB/s" -ForegroundColor Green
+                Write-Host "[$tsNow] COPIED: $($file.RelativePath) ($([math]::Round($copiedSize / 1MB, 2)) MB) @ ${fileMBs} MB/s" -ForegroundColor Green
             }
             else {
-                Write-Host "$progressPrefix COPIED (size differs - MTP: $($file.Size), Local: $copiedSize): $($file.RelativePath) @ ${fileMBs} MB/s" -ForegroundColor Yellow
+                Write-Host "[$tsNow] COPIED (size differs): $($file.RelativePath) @ ${fileMBs} MB/s" -ForegroundColor Yellow
             }
 
-            # Add to index so we don't copy it again if the same filename appears
             $newKey = $file.FileName + "|" + $copiedSize
             $fileIndex.Add($newKey) | Out-Null
             $fileIndexPaths[$newKey] = $targetFilePath
-
             $stateWriter.WriteLine($file.RelativePath)
             $copyCount++
+
+            if ($MaxCopyCount -gt 0 -and $copyCount -ge $MaxCopyCount) {
+                Write-Host ""
+                Write-Host "[LIMIT] Reached -MaxCopyCount $MaxCopyCount. Stopping." -ForegroundColor Yellow
+                $stateWriter.Flush()
+                break
+            }
         }
     }
 

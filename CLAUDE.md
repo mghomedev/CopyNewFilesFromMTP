@@ -19,6 +19,15 @@ PowerShell script that copies files from an MTP-connected Android phone to a Win
 - Use streaming I/O (StreamWriter) for index file creation
 - Must NOT overload the PC: run at BelowNormal process priority with configurable throttle delay between operations
 
+### Performance and Speed
+- The script must NOT introduce noticeable additional overhead over the known MTP file copy speed limitations through USB
+- Every output line must include an absolute timestamp (HH:mm:ss) so that wall-clock time between operations is visible in the log
+- A `-Benchmark` command-line switch must exist that, when enabled, outputs detailed timing for each individual I/O statement or potentially long-running operation (e.g., ParseName, CopyHere, File.Exists, NameSpace, Items() enumeration). This allows developers and AI tools like Claude to identify bottlenecks or performance regressions by reading the log output
+- Avoid PowerShell scriptblock invocation overhead in hot paths (use inline code, not `Invoke-WithRetry` with scriptblocks)
+- Cache MTP folder item enumerations to avoid repeated slow `ParseName` calls (which do linear scans on MTP devices)
+- Use .NET methods (`[System.IO.File]::Exists`, `[System.IO.FileInfo]`, `[System.Threading.Thread]::Sleep`) instead of PowerShell cmdlets (`Test-Path`, `Get-Item`, `Start-Sleep`) in the copy loop for lower overhead
+- Do not use `[Console]::Write()` in the main thread — it throws `IOException: The handle is invalid` when running via `powershell.exe -File`. Use `Write-Host -NoNewline` instead. `[Console]::Write()` is only safe inside a separate runspace (background spinner)
+
 ### Resume Support
 - The user may unplug their phone and come back later
 - State file tracks every processed file; re-running with the same parameters resumes from where it stopped
@@ -129,6 +138,16 @@ Retry wait times (`-RetryWaitSeconds`, `-RetryCount`) are command-line parameter
 - `.github/workflows/release.yml` — GitHub Actions: builds EXE via ps2exe on tag push
 - `README.md` — user documentation
 - `CLAUDE.md` — this file (development guidelines)
+
+### Cache file naming convention
+
+All generated cache/state files use the prefix `_cache_CopyNewFilesFromMTP_` followed by a descriptive name:
+
+- `_cache_CopyNewFilesFromMTP_local_backup_file_index.tsv` — index of files in local ignore/backup folders (for dedup)
+- `_cache_CopyNewFilesFromMTP_mtp_device_file_list.tsv` — cached file list from the MTP device scan
+- `_cache_CopyNewFilesFromMTP_resume_progress.txt` — tracks processed files for resume
+
+This naming makes it obvious: what tool created them (`CopyNewFilesFromMTP`), that they are caches (`_cache_`), and what data they contain. The prefix is also used to skip these files when indexing the target folder.
 
 ## Release Process
 
