@@ -47,6 +47,30 @@ PowerShell script that copies files from an MTP-connected Android phone to a Win
   - All available parameters
 - Do NOT prompt for mandatory parameters; just show help and exit
 
+### Disconnect/Retry Handling
+- The user may disconnect the phone at any time, even mid-copy
+- On any MTP error, the script enters a retry loop with exponential backoff (wait time doubles each attempt, capped at 10 minutes)
+- During retry, the script attempts to reconnect to the MTP device and re-navigate to the source folder
+- Configurable via:
+  - `-RetryCount` (default: 30): maximum retries per file before escalating
+  - `-RetryWaitSeconds` (default: 10): initial wait between retries, doubles each time
+  - `-OnFinalFailure` (default: WaitForever): behavior after all retries exhausted
+    - `WaitForever`: reset retry counter and keep trying indefinitely (user may plug phone back in later)
+    - `Ask`: prompt the user to Skip, Retry, or Wait forever
+    - `Skip`: automatically skip the file and continue
+- The default `WaitForever` means the script never gives up on its own — it patiently waits for the phone to be reconnected
+- When reconnect succeeds, retry immediately — do NOT wait out the remaining backoff timer
+
+### Safe Copy with ~.tmp Files (Cloud-Sync Safe)
+- Files are never kept at their final name until fully verified
+- Flow: MTP CopyHere to target dir -> immediately rename to `~filename.tmp` -> set `Hidden` + `Temporary` attributes -> verify size -> clear attributes -> rename to final name
+- `FILE_ATTRIBUTE_TEMPORARY` + `FILE_ATTRIBUTE_HIDDEN` causes Dropbox and OneDrive to ignore the file during sync
+- The `~` prefix + `.tmp` extension matches Office temp file patterns, which cloud sync services also skip
+- No separate temp folder is used — the `.tmp` file lives on the same volume as the target (atomic rename)
+- Do NOT use `%TEMP%` or a temp folder on a different drive — the final move would not be atomic
+- If the copy is interrupted, the `~.tmp` file is cleaned up before retrying
+- This prevents broken/incomplete files from appearing in the backup or being synced to cloud
+
 ### Scan-Only Mode
 - `-ScanOnly` flag: only connect to MTP device, scan the source folder, list all files with sizes, and exit
 - Does not require `-IgnoreFilesInFoldersBySizeAndName` or `-TargetFolder`

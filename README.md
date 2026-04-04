@@ -26,6 +26,7 @@ This script was developed by [mghomedev](https://github.com/mghomedev) with [Cla
 - **Scan-only mode** (`-ScanOnly`) — test MTP connection and list files without copying anything
 - **Path discovery** — if a path is not found on the device, lists available items at the last valid level
 - **Safety prompts** — warns if ignore folders are missing/empty or the index is empty
+- **Disconnect-safe** — automatically retries with exponential backoff when the phone is disconnected mid-operation; by default waits indefinitely for the phone to be reconnected
 
 ## Installation
 
@@ -107,6 +108,9 @@ Just run the exact same command again. The script detects the state file and sca
 | `-StateFile` | No | Custom path for the resume state file |
 | `-ScanCacheFile` | No | Custom path for the MTP scan cache |
 | `-ThrottleDelayMs` | No | Delay between operations in ms (default: 5) |
+| `-RetryCount` | No | Max retries when device disconnects (default: 30) |
+| `-RetryWaitSeconds` | No | Initial seconds between retries, doubles each time (default: 10) |
+| `-OnFinalFailure` | No | After all retries: `Ask`, `Skip`, or `WaitForever` (default: `WaitForever`) |
 
 ## How it works
 
