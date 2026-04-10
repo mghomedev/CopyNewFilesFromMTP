@@ -1045,7 +1045,7 @@ if (-not $Rescan -and $scanCacheVersionOk) {
             }
             $mtpFiles.Add([PSCustomObject]@{
                 RelativePath = $parts[0]
-                FileName     = [System.IO.Path]::GetFileName($parts[0])
+                FileName     = $parts[0].Substring($parts[0].LastIndexOf('\') + 1)
                 Size         = [long]$parts[1]
                 DateModified = $fileDate
             })
@@ -1098,7 +1098,7 @@ else {
             }
             $mtpFiles.Add([PSCustomObject]@{
                 RelativePath = $parts[0]
-                FileName     = [System.IO.Path]::GetFileName($parts[0])
+                FileName     = $parts[0].Substring($parts[0].LastIndexOf('\') + 1)
                 Size         = [long]$parts[1]
                 DateModified = $fileDate
             })
