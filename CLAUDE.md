@@ -89,6 +89,18 @@ PowerShell script that copies files from an MTP-connected Android phone to a Win
 - "Start fresh" deletes: file index, MTP scan cache, resume state, and any leftover `~*.tmp` files in the target
 - The default for Continue is pressing Enter (no input needed)
 
+### Time-Based Filtering (-NewerThan)
+- `-NewerThan` parameter: only copy files whose modification date on the MTP device is newer than the specified cutoff
+- Supports multiple human-friendly formats:
+  - Relative timespans: `2h` (hours), `3d` (days), `2w` (weeks), `6m` (months), `1y` (years)
+  - Absolute date: `2025-01-15` (ISO format yyyy-MM-dd)
+  - Absolute date+time: `2025-01-15T14:30` (ISO format yyyy-MM-ddTHH:mm)
+- The MTP file modification date is retrieved via `ExtendedProperty("System.DateModified")` with fallback to `GetDetailsOf` column 3
+- The modification date is stored in the scan cache TSV as a third column (ISO 8601 format) so filtering works on resume without re-scanning
+- Files with no retrievable date are NOT skipped (they pass the filter) — the user is warned
+- The parsed cutoff date is displayed at startup so the user can verify it
+- Works in combination with all other filters (deduplication, size matching, etc.)
+
 ### Scan-Only Mode
 - `-ScanOnly` flag: only connect to MTP device, scan the source folder, list all files with sizes, and exit
 - Does not require `-IgnoreFilesInFoldersBySizeAndName` or `-TargetFolder`

@@ -23,6 +23,7 @@ This script was developed by [mghomedev](https://github.com/mghomedev) with [Cla
 - **MTP device scan caching** — avoids re-scanning the phone on resume
 - **Progress with ETA** — shows `[current/total | remaining | ETA]` for every file
 - **Low priority execution** — process runs at `BelowNormal` priority with configurable throttle delay
+- **Time-based filtering** (`-NewerThan`) — only copy files newer than a timespan (`30d`, `6m`, `1y`) or a fixed date (`2025-01-15`)
 - **Scan-only mode** (`-ScanOnly`) — test MTP connection and list files without copying anything
 - **Path discovery** — if a path is not found on the device, lists available items at the last valid level
 - **Safety prompts** — warns if ignore folders are missing/empty or the index is empty
@@ -111,6 +112,45 @@ Just run the exact same command again. The script detects the state file and sca
 | `-RetryWaitSeconds` | No | Initial seconds between retries, doubles each time (default: 10) |
 | `-OnFinalFailure` | No | After all retries: `Ask`, `Skip`, or `WaitForever` (default: `WaitForever`) |
 | `-ResumeMode` | No | On existing state: `Ask`, `Continue`, or `Fresh` (default: `Ask`) |
+| `-NewerThan` | No | Only copy files newer than the specified cutoff (see below) |
+
+### Time-based filtering (-NewerThan)
+
+Use `-NewerThan` to only copy files that were modified after a certain point in time. This is useful when you only care about recent photos/videos and want to skip older files.
+
+**Supported formats:**
+
+| Format | Example | Meaning |
+|---|---|---|
+| Hours | `2h` | Files modified in the last 2 hours |
+| Days | `3d` | Files modified in the last 3 days |
+| Weeks | `2w` | Files modified in the last 2 weeks |
+| Months | `6m` | Files modified in the last 6 months |
+| Years | `1y` | Files modified in the last year |
+| Date | `2025-01-15` | Files modified on or after January 15, 2025 |
+| Date+Time | `2025-01-15T14:30` | Files modified on or after January 15, 2025 at 14:30 |
+
+**Examples:**
+
+```powershell
+# Only copy photos from the last 30 days
+powershell.exe -ExecutionPolicy Bypass -File .\CopyNewFilesFromMTP.ps1 `
+    -DeviceName "Galaxy S24" `
+    -SourcePath "Internal storage\DCIM" `
+    -IgnoreFilesInFoldersBySizeAndName "D:\Backup\Phone2024" `
+    -TargetFolder "D:\Backup\Phone2025" `
+    -NewerThan 30d
+
+# Only copy files from 2025 onwards
+powershell.exe -ExecutionPolicy Bypass -File .\CopyNewFilesFromMTP.ps1 `
+    -DeviceName "Galaxy S24" `
+    -SourcePath "Internal storage\DCIM" `
+    -IgnoreFilesInFoldersBySizeAndName "D:\Backup\Phone2024" `
+    -TargetFolder "D:\Backup\Phone2025" `
+    -NewerThan 2025-01-01
+```
+
+> **Note:** Files where the modification date cannot be read from the MTP device are included (not skipped). The script warns about these files so you can verify them manually.
 
 ### Timing Configuration
 

@@ -77,6 +77,14 @@
     - Continue: Automatically resume from the last state
     - Fresh:    Clear all state files and start from scratch
 
+.PARAMETER NewerThan
+    Only copy files whose modification date on the MTP device is newer than
+    the specified cutoff. Supports relative timespans and absolute dates:
+    - Relative: 2h (hours), 3d (days), 2w (weeks), 6m (months), 1y (years)
+    - Absolute date: 2025-01-15 (yyyy-MM-dd)
+    - Absolute date+time: 2025-01-15T14:30 (yyyy-MM-ddTHH:mm)
+    Files with no retrievable modification date pass the filter (are not skipped).
+
 .EXAMPLE
     # Test MTP connection by scanning and listing files:
     .\CopyNewFilesFromMTP.ps1 `
@@ -125,6 +133,8 @@ param(
     [ValidateSet("Ask", "Continue", "Fresh")]
     [string]$ResumeMode = "Ask",
 
+    [string]$NewerThan = "",
+
     [switch]$CloudSyncSafe,
     [int]$MaxCopyCount = 0,
     [switch]$Benchmark
@@ -135,8 +145,8 @@ $ErrorActionPreference = "Stop"
 
 # ─── Version info ──────────────────────────────────────────────────────────────
 
-$script:AppVersion   = "1.5.0"
-$script:AppBuildDate = "2026-04-04"
+$script:AppVersion   = "1.6.0"
+$script:AppBuildDate = "2026-04-10"
 
 # ─── Timing configuration (all in one place) ──────────────────────────────────
 #
@@ -202,6 +212,7 @@ if (-not $DeviceName -and -not $SourcePath -and -not $ScanOnly) {
     Write-Host "    -RetryWaitSeconds    Seconds between retries, doubles each time (default: 10)"
     Write-Host "    -OnFinalFailure      After all retries: Ask, Skip, or WaitForever (default: WaitForever)"
     Write-Host "    -ResumeMode          On existing state: Ask, Continue, or Fresh (default: Ask)"
+    Write-Host "    -NewerThan           Only copy files newer than: 2h, 3d, 2w, 6m, 1y, or 2025-01-15"
     Write-Host "    -CloudSyncSafe       Rename files during copy to prevent Dropbox/OneDrive upload"
     Write-Host "    -MaxCopyCount        Stop after copying this many files (0 = unlimited, default: 0)"
     Write-Host "    -Benchmark           Output detailed per-statement timing for performance analysis"
@@ -235,6 +246,44 @@ if (-not $ScanOnly) {
     if ($IgnoreFilesInFoldersBySizeAndName.Count -eq 0) {
         throw "-IgnoreFilesInFoldersBySizeAndName is required unless -ScanOnly is specified. Pass one or more folder paths."
     }
+}
+
+# ─── Parse -NewerThan into a cutoff DateTime ──────────────────────────────────
+
+$script:NewerThanCutoff = $null
+
+if ($NewerThan) {
+    $now = [datetime]::Now
+    # Try relative timespan: number + unit (h/d/w/m/y)
+    if ($NewerThan -match '^\s*(\d+)\s*(h|d|w|m|y)\s*$') {
+        $amount = [int]$matches[1]
+        $unit = $matches[2]
+        switch ($unit) {
+            'h' { $script:NewerThanCutoff = $now.AddHours(-$amount) }
+            'd' { $script:NewerThanCutoff = $now.AddDays(-$amount) }
+            'w' { $script:NewerThanCutoff = $now.AddDays(-($amount * 7)) }
+            'm' { $script:NewerThanCutoff = $now.AddMonths(-$amount) }
+            'y' { $script:NewerThanCutoff = $now.AddYears(-$amount) }
+        }
+    }
+    else {
+        # Try absolute date/datetime (yyyy-MM-dd or yyyy-MM-ddTHH:mm)
+        $parsed = [datetime]::MinValue
+        if ([datetime]::TryParseExact($NewerThan, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+            $script:NewerThanCutoff = $parsed
+        }
+        elseif ([datetime]::TryParseExact($NewerThan, 'yyyy-MM-dd\THH:mm', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+            $script:NewerThanCutoff = $parsed
+        }
+        elseif ([datetime]::TryParse($NewerThan, [ref]$parsed)) {
+            $script:NewerThanCutoff = $parsed
+        }
+        else {
+            throw "-NewerThan value '$NewerThan' is not recognized. Use: 2h, 3d, 2w, 6m, 1y, 2025-01-15, or 2025-01-15T14:30"
+        }
+    }
+
+    Write-Host "[FILTER] -NewerThan: only copying files modified after $($script:NewerThanCutoff.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Cyan
 }
 
 # ─── Defaults ───────────────────────────────────────────────────────────────────
@@ -666,6 +715,33 @@ function Get-MTPFileSize {
     return -1
 }
 
+function Get-MTPFileDate {
+    param([System.__ComObject]$Item, [System.__ComObject]$ParentFolder)
+
+    # Try ExtendedProperty first (returns DateTime)
+    try {
+        $dateVal = $Item.ExtendedProperty("System.DateModified")
+        if ($null -ne $dateVal) {
+            return [datetime]$dateVal
+        }
+    }
+    catch {}
+
+    # Fallback: GetDetailsOf column 3 (Date modified)
+    try {
+        $dateStr = $ParentFolder.GetDetailsOf($Item, 3)
+        if ($dateStr) {
+            $parsed = [datetime]::MinValue
+            if ([datetime]::TryParse($dateStr.Trim(), [ref]$parsed)) {
+                return $parsed
+            }
+        }
+    }
+    catch {}
+
+    return $null
+}
+
 function Scan-MTPFolderRecursive {
     param(
         [System.__ComObject]$Folder,
@@ -695,8 +771,10 @@ function Scan-MTPFolderRecursive {
         }
         else {
             $size = Get-MTPFileSize -Item $item -ParentFolder $Folder
+            $dateObj = Get-MTPFileDate -Item $item -ParentFolder $Folder
+            $dateStr = if ($null -ne $dateObj) { $dateObj.ToString('o') } else { "" }
             $filePath = if ($RelativePath) { "$RelativePath\$($item.Name)" } else { $item.Name }
-            $Writer.WriteLine("$filePath`t$size")
+            $Writer.WriteLine("$filePath`t$size`t$dateStr")
             $Counter.Value++
 
             if ($Counter.Value % 1000 -eq 0) {
@@ -818,12 +896,17 @@ if (-not $Rescan -and (Test-Path $ScanCacheFile)) {
         $lineNum++
         if ($lineNum -eq 1) { continue }
 
-        $parts = $line.Split("`t", 2)
-        if ($parts.Length -eq 2) {
+        $parts = $line.Split("`t")
+        if ($parts.Length -ge 2) {
+            $fileDate = $null
+            if ($parts.Length -ge 3 -and $parts[2]) {
+                try { $fileDate = [datetime]::Parse($parts[2]) } catch {}
+            }
             $mtpFiles.Add([PSCustomObject]@{
                 RelativePath = $parts[0]
                 FileName     = [System.IO.Path]::GetFileName($parts[0])
                 Size         = [long]$parts[1]
+                DateModified = $fileDate
             })
         }
     }
@@ -846,7 +929,7 @@ else {
 
     Write-Host "[MTP] Scanning all files recursively..." -ForegroundColor Cyan
     $scanWriter = [System.IO.StreamWriter]::new($ScanCacheFile, $false, [System.Text.Encoding]::UTF8)
-    $scanWriter.WriteLine("RelativePath`tSize")
+    $scanWriter.WriteLine("RelativePath`tSize`tDateModified")
     $scanCount = [ref]0
 
     $scanStart = Get-Date
@@ -863,12 +946,17 @@ else {
         $lineNum++
         if ($lineNum -eq 1) { continue }
 
-        $parts = $line.Split("`t", 2)
-        if ($parts.Length -eq 2) {
+        $parts = $line.Split("`t")
+        if ($parts.Length -ge 2) {
+            $fileDate = $null
+            if ($parts.Length -ge 3 -and $parts[2]) {
+                try { $fileDate = [datetime]::Parse($parts[2]) } catch {}
+            }
             $mtpFiles.Add([PSCustomObject]@{
                 RelativePath = $parts[0]
                 FileName     = [System.IO.Path]::GetFileName($parts[0])
                 Size         = [long]$parts[1]
+                DateModified = $fileDate
             })
         }
     }
@@ -877,6 +965,32 @@ else {
 if ($mtpFiles.Count -eq 0) {
     Write-Host "[MTP] No files found on device. Nothing to do." -ForegroundColor Yellow
     exit 0
+}
+
+# ─── Apply -NewerThan date filter ──────────────────────────────────────────────
+
+if ($script:NewerThanCutoff) {
+    $beforeCount = $mtpFiles.Count
+    $filteredFiles = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $skippedByDate = 0
+    $noDateCount = 0
+    foreach ($f in $mtpFiles) {
+        if ($null -eq $f.DateModified) {
+            $noDateCount++
+            $filteredFiles.Add($f)
+        }
+        elseif ($f.DateModified -ge $script:NewerThanCutoff) {
+            $filteredFiles.Add($f)
+        }
+        else {
+            $skippedByDate++
+        }
+    }
+    $mtpFiles = $filteredFiles
+    Write-Host "[FILTER] Date filter applied: $($mtpFiles.Count) files pass (skipped $skippedByDate older files)" -ForegroundColor Cyan
+    if ($noDateCount -gt 0) {
+        Write-Host "[FILTER] WARNING: $noDateCount files had no date metadata and were included (not skipped)" -ForegroundColor Yellow
+    }
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
