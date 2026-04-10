@@ -171,6 +171,81 @@ $script:RetryBackoffMaxSeconds = 600
 $script:ScanYieldInterval      = 500
 $script:ScanYieldMs            = 1
 
+# ─── Cache file headers and footers ────────────────────────────────────────────
+# All cache/state files start with two header lines and end with a footer line:
+#   Line 1: version   — "# CopyNewFilesFromMTP vX.Y.Z"
+#   Line 2: params    — "# Params: <key>=<value> | <key>=<value> | ..."
+#   ...data lines...
+#   Last line: footer  — "# Completed: 2026-04-10T14:30:00"
+#
+# The footer proves the file was written completely. If the footer is missing
+# (e.g., script crashed mid-write), the cache is rejected on next load.
+
+$script:CacheVersionHeader = "# CopyNewFilesFromMTP v$($script:AppVersion)"
+$script:CacheFooterPrefix  = "# Completed: "
+
+function Build-CacheParamsLine {
+    param([hashtable]$Params)
+    $parts = @()
+    foreach ($key in ($Params.Keys | Sort-Object)) {
+        $parts += "$key=$($Params[$key])"
+    }
+    return "# Params: " + ($parts -join " | ")
+}
+
+function Get-CacheFooterLine {
+    return $script:CacheFooterPrefix + [datetime]::Now.ToString('yyyy-MM-ddTHH:mm:ss')
+}
+
+function Read-CacheFooter {
+    param([string]$FilePath)
+    # Returns the completion timestamp string if a valid footer exists, or $null
+    if (-not (Test-Path $FilePath)) { return $null }
+    try {
+        $lines = [System.IO.File]::ReadAllLines($FilePath, [System.Text.Encoding]::UTF8)
+        if ($lines.Length -eq 0) { return $null }
+        $lastLine = $lines[$lines.Length - 1]
+        if ($lastLine.StartsWith($script:CacheFooterPrefix)) {
+            return $lastLine.Substring($script:CacheFooterPrefix.Length)
+        }
+        return $null
+    }
+    catch { return $null }
+}
+
+function Test-CacheHeader {
+    param(
+        [string]$FilePath,
+        [string]$ExpectedParamsLine,
+        [switch]$RequireFooter
+    )
+    if (-not (Test-Path $FilePath)) { return $false }
+    try {
+        $reader = [System.IO.StreamReader]::new($FilePath, [System.Text.Encoding]::UTF8)
+        $line1 = $reader.ReadLine()
+        $line2 = $reader.ReadLine()
+        $reader.Close()
+        if ($line1 -ne $script:CacheVersionHeader) { return $false }
+        if ($ExpectedParamsLine -and $line2 -ne $ExpectedParamsLine) { return $false }
+        # Check footer exists (file was written completely) — only for index/scan cache
+        if ($RequireFooter) {
+            $footer = Read-CacheFooter $FilePath
+            if ($null -eq $footer) { return $false }
+        }
+        return $true
+    }
+    catch { return $false }
+}
+
+function Write-CacheHeaders {
+    param(
+        [System.IO.StreamWriter]$Writer,
+        [string]$ParamsLine
+    )
+    $Writer.WriteLine($script:CacheVersionHeader)
+    $Writer.WriteLine($ParamsLine)
+}
+
 # ─── Show help if no arguments ─────────────────────────────────────────────────
 
 if (-not $DeviceName -and -not $SourcePath -and -not $ScanOnly) {
@@ -286,6 +361,25 @@ if ($NewerThan) {
     Write-Host "[FILTER] -NewerThan: only copying files modified after $($script:NewerThanCutoff.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Cyan
 }
 
+# ─── Build cache parameter lines for each cache file type ─────────────────────
+
+$script:ScanCacheParams = Build-CacheParamsLine @{
+    DeviceName = $DeviceName
+    SourcePath = $SourcePath
+}
+
+if (-not $ScanOnly) {
+    $sortedIgnore = ($IgnoreFilesInFoldersBySizeAndName | Sort-Object) -join ";"
+    $script:IndexParams = Build-CacheParamsLine @{
+        IgnoreFolders = $sortedIgnore
+    }
+    $script:StateParams = Build-CacheParamsLine @{
+        DeviceName = $DeviceName
+        SourcePath = $SourcePath
+        TargetFolder = $TargetFolder
+    }
+}
+
 # ─── Defaults ───────────────────────────────────────────────────────────────────
 
 if (-not $ScanOnly) {
@@ -311,9 +405,30 @@ if (-not $ScanOnly) {
 # ─── Check for existing state and ask to resume or start fresh ─────────────────
 
 if (-not $ScanOnly) {
-    $hasIndex = $IndexFile -and (Test-Path $IndexFile)
-    $hasState = $StateFile -and (Test-Path $StateFile)
-    $hasScanCache = $ScanCacheFile -and (Test-Path $ScanCacheFile)
+    $hasIndex = $IndexFile -and (Test-Path $IndexFile) -and (Test-CacheHeader $IndexFile $script:IndexParams -RequireFooter)
+    $hasState = $StateFile -and (Test-Path $StateFile) -and (Test-CacheHeader $StateFile $script:StateParams)
+    $hasScanCache = $ScanCacheFile -and (Test-Path $ScanCacheFile) -and (Test-CacheHeader $ScanCacheFile $script:ScanCacheParams -RequireFooter)
+    # Detect and warn about incompatible or incomplete files
+    $hasStaleFiles = $false
+    $staleReasons = @()
+    foreach ($check in @(
+        @{ Path=$IndexFile; Params=$script:IndexParams; Name="index"; Footer=$true },
+        @{ Path=$ScanCacheFile; Params=$script:ScanCacheParams; Name="scan cache"; Footer=$true },
+        @{ Path=$StateFile; Params=$script:StateParams; Name="state"; Footer=$false }
+    )) {
+        if ($check.Path -and (Test-Path $check.Path)) {
+            $ok = if ($check.Footer) { Test-CacheHeader $check.Path $check.Params -RequireFooter } else { Test-CacheHeader $check.Path $check.Params }
+            if (-not $ok) {
+                $hasStaleFiles = $true
+                $staleReasons += $check.Name
+            }
+        }
+    }
+    if ($hasStaleFiles) {
+        Write-Host ""
+        Write-Host "[CACHE] Incompatible cache files detected ($($staleReasons -join ', ')). They will be rebuilt." -ForegroundColor Yellow
+        Write-Host "[CACHE] This happens when the script version or input parameters (device, paths) have changed." -ForegroundColor Yellow
+    }
     $hasAnyState = $hasIndex -or $hasState -or $hasScanCache
 
     if ($hasAnyState) {
@@ -328,19 +443,26 @@ if (-not $ScanOnly) {
         # Gather stats from existing state files for display
         $resumeStats = @{}
         if ($hasIndex) {
-            $fi = [System.IO.FileInfo]::new($IndexFile)
-            $resumeStats.IndexDate = $fi.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
-            $resumeStats.IndexLines = ([System.IO.File]::ReadAllLines($IndexFile)).Count - 1  # minus header
+            $resumeStats.IndexDate = Read-CacheFooter $IndexFile
+            $resumeStats.IndexLines = ([System.IO.File]::ReadAllLines($IndexFile)).Count - 4  # minus version + params + column header + footer
         }
         if ($hasScanCache) {
-            $fi = [System.IO.FileInfo]::new($ScanCacheFile)
-            $resumeStats.ScanDate = $fi.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
-            $resumeStats.ScanTotal = ([System.IO.File]::ReadAllLines($ScanCacheFile)).Count - 1  # minus header
+            $resumeStats.ScanDate = Read-CacheFooter $ScanCacheFile
+            $resumeStats.ScanTotal = ([System.IO.File]::ReadAllLines($ScanCacheFile)).Count - 4  # minus version + params + column header + footer
         }
         if ($hasState) {
-            $fi = [System.IO.FileInfo]::new($StateFile)
-            $resumeStats.StateDate = $fi.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
-            $resumeStats.StateProcessed = ([System.IO.File]::ReadAllLines($StateFile)).Count
+            $stateFooter = Read-CacheFooter $StateFile
+            if ($stateFooter) {
+                $resumeStats.StateDate = $stateFooter
+                $resumeStats.StateComplete = $true
+                $resumeStats.StateProcessed = ([System.IO.File]::ReadAllLines($StateFile)).Count - 3  # minus version + params header + footer
+            }
+            else {
+                $fi = [System.IO.FileInfo]::new($StateFile)
+                $resumeStats.StateDate = $fi.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+                $resumeStats.StateComplete = $false
+                $resumeStats.StateProcessed = ([System.IO.File]::ReadAllLines($StateFile)).Count - 2  # minus version + params header
+            }
         }
         if ($resumeStats.ContainsKey('ScanTotal') -and $resumeStats.ContainsKey('StateProcessed')) {
             $resumeStats.Remaining = $resumeStats.ScanTotal - $resumeStats.StateProcessed
@@ -354,7 +476,8 @@ if (-not $ScanOnly) {
                     Write-Host "  Total files on device: $($resumeStats.ScanTotal)   (scanned $($resumeStats.ScanDate))" -ForegroundColor Gray
                 }
                 if ($resumeStats.ContainsKey('StateProcessed')) {
-                    Write-Host "  Already processed:     $($resumeStats.StateProcessed)   (last activity $($resumeStats.StateDate))" -ForegroundColor Gray
+                    $stateLabel = if ($resumeStats.StateComplete) { "completed $($resumeStats.StateDate)" } else { "interrupted, last activity $($resumeStats.StateDate)" }
+                    Write-Host "  Already processed:     $($resumeStats.StateProcessed)   ($stateLabel)" -ForegroundColor Gray
                 }
                 if ($resumeStats.ContainsKey('Remaining')) {
                     Write-Host "  Remaining:             $($resumeStats.Remaining)" -ForegroundColor Gray
@@ -369,15 +492,16 @@ if (-not $ScanOnly) {
                 Write-Host "[RESUME] Found previous state from an earlier run:" -ForegroundColor Yellow
                 Write-Host ""
                 if ($hasIndex) {
-                    Write-Host "  File index:     $($resumeStats.IndexLines) entries   (created $($resumeStats.IndexDate))" -ForegroundColor Gray
+                    Write-Host "  File index:     $($resumeStats.IndexLines) entries   (completed $($resumeStats.IndexDate))" -ForegroundColor Gray
                     Write-Host "                  $IndexFile" -ForegroundColor DarkGray
                 }
                 if ($hasScanCache) {
-                    Write-Host "  MTP scan cache: $($resumeStats.ScanTotal) files on device   (scanned $($resumeStats.ScanDate))" -ForegroundColor Gray
+                    Write-Host "  MTP scan cache: $($resumeStats.ScanTotal) files on device   (completed $($resumeStats.ScanDate))" -ForegroundColor Gray
                     Write-Host "                  $ScanCacheFile" -ForegroundColor DarkGray
                 }
                 if ($hasState) {
-                    Write-Host "  Resume state:   $($resumeStats.StateProcessed) files processed   (last activity $($resumeStats.StateDate))" -ForegroundColor Gray
+                    $stateLabel = if ($resumeStats.StateComplete) { "completed $($resumeStats.StateDate)" } else { "interrupted, last activity $($resumeStats.StateDate)" }
+                    Write-Host "  Resume state:   $($resumeStats.StateProcessed) files processed   ($stateLabel)" -ForegroundColor Gray
                     Write-Host "                  $StateFile" -ForegroundColor DarkGray
                 }
                 if ($resumeStats.ContainsKey('Remaining')) {
@@ -475,6 +599,7 @@ function Build-FileIndex {
     }
 
     $writer = [System.IO.StreamWriter]::new($OutputFile, $false, [System.Text.Encoding]::UTF8)
+    Write-CacheHeaders -Writer $writer -ParamsLine $script:IndexParams
     $writer.WriteLine("FileName`tSize`tFullPath")
     $totalFiles = 0
 
@@ -505,6 +630,7 @@ function Build-FileIndex {
         Write-Host "[INDEX] Indexed $folderCount files from: $folder" -ForegroundColor Green
     }
 
+    $writer.WriteLine((Get-CacheFooterLine))
     $writer.Close()
     Write-Host "[INDEX] Total files indexed: $totalFiles" -ForegroundColor Green
     Write-Host "[INDEX] Index saved to: $OutputFile" -ForegroundColor Green
@@ -525,7 +651,8 @@ function Load-FileIndex {
     $lineNum = 0
     foreach ($line in [System.IO.File]::ReadLines($IndexPath, [System.Text.Encoding]::UTF8)) {
         $lineNum++
-        if ($lineNum -eq 1) { continue } # skip header
+        if ($lineNum -le 3) { continue } # skip version header + params header + column header
+        if ($line.StartsWith('#')) { continue } # skip footer
 
         $parts = $line.Split("`t", 3)
         if ($parts.Length -ge 2) {
@@ -543,17 +670,23 @@ function Load-FileIndex {
 }
 
 if (-not $ScanOnly) {
-    # Check if index needs to be built
-    if ($RebuildIndex -or -not (Test-Path $IndexFile)) {
+    # Check if index needs to be built (or rebuilt due to version mismatch)
+    $indexVersionOk = (Test-Path $IndexFile) -and (Test-CacheHeader $IndexFile $script:IndexParams -RequireFooter)
+    if (-not $indexVersionOk -and (Test-Path $IndexFile)) {
+        $reason = if ($null -eq (Read-CacheFooter $IndexFile)) { "incomplete (previous build may have crashed)" } else { "incompatible (different version or ignore folders)" }
+        Write-Host "[INDEX] Index file is $reason. Rebuilding..." -ForegroundColor Yellow
+    }
+    if ($RebuildIndex -or -not $indexVersionOk) {
         $builtCount = Build-FileIndex -Folders $IgnoreFilesInFoldersBySizeAndName -OutputFile $IndexFile
         if ($builtCount -eq 0) {
             Confirm-Continue -Message 'The generated ignore index is empty (0 files). This means no files will be skipped during copy - everything from the device will be copied. Did you make a mistake?'
         }
     }
     else {
+        $indexFooterDate = Read-CacheFooter $IndexFile
         Write-Host ""
         Write-Host "[INDEX] File index already exists: $IndexFile" -ForegroundColor Cyan
-        Write-Host "[INDEX] Use -RebuildIndex to force rebuild." -ForegroundColor Cyan
+        Write-Host "[INDEX] Index completed: $indexFooterDate. Use -RebuildIndex to force rebuild." -ForegroundColor Cyan
     }
 
     $indexData = Load-FileIndex -IndexPath $IndexFile
@@ -883,18 +1016,26 @@ if ($ScanOnly) {
 
 $mtpFiles = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-if (-not $Rescan -and (Test-Path $ScanCacheFile)) {
+$scanCacheVersionOk = (Test-Path $ScanCacheFile) -and (Test-CacheHeader $ScanCacheFile $script:ScanCacheParams -RequireFooter)
+if (-not $scanCacheVersionOk -and -not $Rescan -and (Test-Path $ScanCacheFile)) {
+    $reason = if ($null -eq (Read-CacheFooter $ScanCacheFile)) { "incomplete (previous scan may have crashed)" } else { "incompatible (different version, device, or source path)" }
+    Write-Host "[MTP] Scan cache is $reason. Rescanning..." -ForegroundColor Yellow
+}
+
+if (-not $Rescan -and $scanCacheVersionOk) {
     Write-Host ""
     Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Yellow
     Write-Host " STEP 2: Loading cached MTP device scan"                      -ForegroundColor Yellow
     Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Yellow
+    $scanFooterDate = Read-CacheFooter $ScanCacheFile
     Write-Host "[MTP] Loading scan cache: $ScanCacheFile" -ForegroundColor Cyan
-    Write-Host "[MTP] Use -Rescan to force a fresh device scan." -ForegroundColor Cyan
+    Write-Host "[MTP] Cache completed: $scanFooterDate. Use -Rescan to force a fresh device scan." -ForegroundColor Cyan
 
     $lineNum = 0
     foreach ($line in [System.IO.File]::ReadLines($ScanCacheFile, [System.Text.Encoding]::UTF8)) {
         $lineNum++
-        if ($lineNum -eq 1) { continue }
+        if ($lineNum -le 3) { continue }
+        if ($line.StartsWith('#')) { continue } # skip footer
 
         $parts = $line.Split("`t")
         if ($parts.Length -ge 2) {
@@ -929,11 +1070,13 @@ else {
 
     Write-Host "[MTP] Scanning all files recursively..." -ForegroundColor Cyan
     $scanWriter = [System.IO.StreamWriter]::new($ScanCacheFile, $false, [System.Text.Encoding]::UTF8)
+    Write-CacheHeaders -Writer $scanWriter -ParamsLine $script:ScanCacheParams
     $scanWriter.WriteLine("RelativePath`tSize`tDateModified")
     $scanCount = [ref]0
 
     $scanStart = Get-Date
     Scan-MTPFolderRecursive -Folder $sourceFolder -RelativePath "" -Writer $scanWriter -Counter $scanCount
+    $scanWriter.WriteLine((Get-CacheFooterLine))
     $scanWriter.Close()
     $scanDuration = (Get-Date) - $scanStart
 
@@ -944,7 +1087,8 @@ else {
     $lineNum = 0
     foreach ($line in [System.IO.File]::ReadLines($ScanCacheFile, [System.Text.Encoding]::UTF8)) {
         $lineNum++
-        if ($lineNum -eq 1) { continue }
+        if ($lineNum -le 3) { continue }
+        if ($line.StartsWith('#')) { continue } # skip footer
 
         $parts = $line.Split("`t")
         if ($parts.Length -ge 2) {
@@ -1002,13 +1146,19 @@ Write-Host "══════════════════════�
 Write-Host " STEP 3: Copying new files to target folder"                  -ForegroundColor Yellow
 Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Yellow
 
-# Load resume state
+# Load resume state (only if version and parameters match)
 $processedFiles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-if (Test-Path $StateFile) {
+if ((Test-Path $StateFile) -and (Test-CacheHeader $StateFile $script:StateParams)) {
     foreach ($line in [System.IO.File]::ReadLines($StateFile, [System.Text.Encoding]::UTF8)) {
-        $processedFiles.Add($line.Trim()) | Out-Null
+        $trimmed = $line.Trim()
+        if ($trimmed.StartsWith('#')) { continue }
+        $processedFiles.Add($trimmed) | Out-Null
     }
     Write-Host "[RESUME] Loaded $($processedFiles.Count) already-processed entries from previous run." -ForegroundColor Cyan
+}
+elseif (Test-Path $StateFile) {
+    Write-Host "[RESUME] State file is incompatible (different version, device, or target). Starting fresh." -ForegroundColor Yellow
+    Remove-Item -LiteralPath $StateFile -Force
 }
 
 # Calculate remaining work
@@ -1223,8 +1373,12 @@ $script:spinnerPs = [powershell]::Create().AddScript({
 $script:spinnerPs.Runspace = $script:spinnerRunspace
 $script:spinnerHandle = $script:spinnerPs.BeginInvoke()
 
-# Open state file for appending
+# Open state file for appending (write headers if new)
+$stateFileIsNew = -not (Test-Path $StateFile)
 $stateWriter = [System.IO.StreamWriter]::new($StateFile, $true, [System.Text.Encoding]::UTF8)
+if ($stateFileIsNew) {
+    Write-CacheHeaders -Writer $stateWriter -ParamsLine $script:StateParams
+}
 
 $copyCount = 0
 $skipCount = 0
@@ -1525,6 +1679,7 @@ foreach ($file in $toProcess) {
     }
 }
 
+$stateWriter.WriteLine((Get-CacheFooterLine))
 $stateWriter.Close()
 
 # Stop background spinner

@@ -198,6 +198,14 @@ The script creates these cache/state files in the target folder. All filenames s
 | `_cache_CopyNewFilesFromMTP_mtp_device_file_list.tsv` | **MTP device file list.** Tab-separated list of every file found on the phone during the MTP scan (relative path, size in bytes). Cached so the phone doesn't need to be re-scanned on resume. Rebuilt with `-Rescan`. |
 | `_cache_CopyNewFilesFromMTP_resume_progress.txt` | **Resume progress tracker.** One line per processed file (relative path). On restart, files listed here are skipped. This is what enables unplug-and-resume. |
 
+All cache files include a version header, a record of the input parameters (device name, source path, ignore folders, target folder) that produced them, and a completion footer with a timestamp. The script automatically detects and rebuilds cache files that are incompatible or incomplete:
+
+- **Version mismatch**: script was updated since the cache was created
+- **Parameter mismatch**: you changed the device name, source path, ignore folders, or target folder
+- **Incomplete file**: the previous run crashed or was interrupted before the cache was fully written (missing completion footer)
+
+You do not need to manually delete stale cache files — the script handles this automatically.
+
 ## Notes
 
 - **Execution Policy**: Windows may block PowerShell scripts by default. Use `powershell.exe -ExecutionPolicy Bypass -File ...` to run without changing system settings.

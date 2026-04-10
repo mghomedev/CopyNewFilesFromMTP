@@ -159,6 +159,30 @@ All generated cache/state files use the prefix `_cache_CopyNewFilesFromMTP_` fol
 - `_cache_CopyNewFilesFromMTP_mtp_device_file_list.tsv` — cached file list from the MTP device scan
 - `_cache_CopyNewFilesFromMTP_resume_progress.txt` — tracks processed files for resume
 
+### Cache file versioning, parameter binding, and integrity
+
+- Every cache/state file starts with two header lines and ends with a footer line:
+  - Line 1 — version: `# CopyNewFilesFromMTP vX.Y.Z`
+  - Line 2 — parameters: `# Params: Key1=Value1 | Key2=Value2 | ...`
+  - Last line — footer: `# Completed: 2026-04-10T14:30:00`
+- The parameters line records which input data produced this cache, so the file is only reused when both the script version AND the input parameters match
+- The footer line proves the file was written completely — if missing, the cache was interrupted (e.g., crash, Ctrl+C) and is automatically rejected
+- Each cache type tracks the parameters relevant to it:
+  - **Index file**: `IgnoreFolders=<semicolon-separated sorted paths>`
+  - **Scan cache**: `DeviceName=<name> | SourcePath=<path>`
+  - **State file**: `DeviceName=<name> | SourcePath=<path> | TargetFolder=<path>`
+- Helper functions:
+  - `Build-CacheParamsLine` — builds the params line from a hashtable (keys sorted alphabetically for deterministic comparison)
+  - `Write-CacheHeaders` — writes version + params header lines
+  - `Get-CacheFooterLine` — returns a footer line with current timestamp
+  - `Read-CacheFooter` — reads the last line and returns the completion timestamp, or `$null` if no valid footer
+  - `Test-CacheHeader` — validates version, params, and optionally the footer (`-RequireFooter` switch)
+- Footer is **required** for the index file and scan cache (they must be complete to be useful)
+- Footer is **optional** for the state file (it is a log of processed files — even a partial one is valuable for resume)
+- The completion timestamp from the footer is displayed to the user when loading cached files, so they can assess whether the cache is still relevant
+- When the resume prompt shows state file info, it distinguishes between "completed" (has footer) and "interrupted" (no footer) runs
+- This prevents: reusing caches from older script versions, reusing a scan cache from a different device/path, reusing an index built from different ignore folders, and using half-written files from crashes
+
 This naming makes it obvious: what tool created them (`CopyNewFilesFromMTP`), that they are caches (`_cache_`), and what data they contain. The prefix is also used to skip these files when indexing the target folder.
 
 ## Release Process
