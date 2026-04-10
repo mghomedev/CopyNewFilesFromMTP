@@ -145,7 +145,7 @@ $ErrorActionPreference = "Stop"
 
 # ─── Version info ──────────────────────────────────────────────────────────────
 
-$script:AppVersion   = "1.6.0"
+$script:AppVersion   = "1.8.0"
 $script:AppBuildDate = "2026-04-10"
 
 # ─── Timing configuration (all in one place) ──────────────────────────────────
@@ -244,6 +244,56 @@ function Write-CacheHeaders {
     )
     $Writer.WriteLine($script:CacheVersionHeader)
     $Writer.WriteLine($ParamsLine)
+}
+
+# ─── Windows NTFS filename sanitization ────────────────────────────────────────
+# Android (ext4) and iOS (APFS) allow characters that are illegal on Windows NTFS:
+#
+# Forbidden characters:  < > : " / \ | ? *  and control characters 0x00-0x1F
+# Reserved device names: CON PRN AUX NUL COM1-COM9 LPT1-LPT9 (with or without extension)
+# Trailing dots/spaces:  "file." and "file " are invalid on NTFS
+#
+# Windows Shell CopyHere REMOVES invalid characters entirely when auto-renaming
+# (e.g. "10:45:51" becomes "104551"). We match this behavior so our sanitized names
+# are identical to what CopyHere produces, preventing overwrite-dialog hangs.
+
+# Matches any character forbidden in NTFS filenames (includes control chars 0x00-0x1F)
+$script:InvalidFileNameChars = [regex]'[<>:"/\\|?*\x00-\x1F]'
+$script:InvalidFileNameCharsForDirComponent = [regex]'[<>:"|?*\x00-\x1F]'
+
+# Windows reserved device names — these cannot be used as filenames (with or without extension)
+$script:ReservedNames = [regex]'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..+)?$'
+
+function Get-SanitizedComponent {
+    param([string]$Name, [regex]$CharPattern)
+    # Step 1: Remove invalid characters (matches Windows Shell CopyHere behavior)
+    $sanitized = $CharPattern.Replace($Name, '')
+    # Step 2: Strip trailing dots and spaces (NTFS silently strips them, causing mismatches)
+    $sanitized = $sanitized.TrimEnd('.', ' ')
+    # Step 3: Handle reserved device names (e.g., CON, NUL, COM1) by prefixing with underscore
+    if ($script:ReservedNames.IsMatch($sanitized)) {
+        $sanitized = '_' + $sanitized
+    }
+    # Step 4: If name became empty after sanitization, use a fallback
+    if ([string]::IsNullOrWhiteSpace($sanitized)) {
+        $sanitized = '_unnamed'
+    }
+    return $sanitized
+}
+
+function Get-SanitizedRelativePath {
+    param([string]$RelativePath)
+    $parts = $RelativePath.Split('\')
+    for ($i = 0; $i -lt $parts.Length; $i++) {
+        if ($i -eq $parts.Length - 1) {
+            # Filename: remove all invalid chars including forward slash
+            $parts[$i] = Get-SanitizedComponent $parts[$i] $script:InvalidFileNameChars
+        } else {
+            # Directory component: remove invalid chars but keep backslash separators
+            $parts[$i] = Get-SanitizedComponent $parts[$i] $script:InvalidFileNameCharsForDirComponent
+        }
+    }
+    return $parts -join '\'
 }
 
 # ─── Show help if no arguments ─────────────────────────────────────────────────
@@ -903,6 +953,8 @@ function Scan-MTPFolderRecursive {
             }
         }
         else {
+            # Skip MTP items with empty names (broken entries or dirs misreported as files)
+            if ([string]::IsNullOrWhiteSpace($item.Name)) { continue }
             $size = Get-MTPFileSize -Item $item -ParentFolder $Folder
             $dateObj = Get-MTPFileDate -Item $item -ParentFolder $Folder
             $dateStr = if ($null -ne $dateObj) { $dateObj.ToString('o') } else { "" }
@@ -1039,13 +1091,16 @@ if (-not $Rescan -and $scanCacheVersionOk) {
 
         $parts = $line.Split("`t")
         if ($parts.Length -ge 2) {
+            # Skip entries with empty filenames (broken MTP entries, e.g. path ending with \)
+            $entryFileName = $parts[0].Substring($parts[0].LastIndexOf('\') + 1)
+            if ([string]::IsNullOrWhiteSpace($entryFileName)) { continue }
             $fileDate = $null
             if ($parts.Length -ge 3 -and $parts[2]) {
                 try { $fileDate = [datetime]::Parse($parts[2]) } catch {}
             }
             $mtpFiles.Add([PSCustomObject]@{
                 RelativePath = $parts[0]
-                FileName     = $parts[0].Substring($parts[0].LastIndexOf('\') + 1)
+                FileName     = $entryFileName
                 Size         = [long]$parts[1]
                 DateModified = $fileDate
             })
@@ -1092,13 +1147,16 @@ else {
 
         $parts = $line.Split("`t")
         if ($parts.Length -ge 2) {
+            # Skip entries with empty filenames (broken MTP entries, e.g. path ending with \)
+            $entryFileName = $parts[0].Substring($parts[0].LastIndexOf('\') + 1)
+            if ([string]::IsNullOrWhiteSpace($entryFileName)) { continue }
             $fileDate = $null
             if ($parts.Length -ge 3 -and $parts[2]) {
                 try { $fileDate = [datetime]::Parse($parts[2]) } catch {}
             }
             $mtpFiles.Add([PSCustomObject]@{
                 RelativePath = $parts[0]
-                FileName     = $parts[0].Substring($parts[0].LastIndexOf('\') + 1)
+                FileName     = $entryFileName
                 Size         = [long]$parts[1]
                 DateModified = $fileDate
             })
@@ -1429,13 +1487,15 @@ foreach ($file in $toProcess) {
     }
     else {
         # File is new - copy it
-        # Determine target path
-        $targetFilePath = Join-Path $TargetFolder $file.RelativePath
+        # Determine target path (sanitize for Windows-illegal characters from MTP)
+        $sanitizedRelPath = Get-SanitizedRelativePath $file.RelativePath
+        $targetFilePath = Join-Path $TargetFolder $sanitizedRelPath
         $targetDir = [System.IO.Path]::GetDirectoryName($targetFilePath)
+        $wasSanitized = $sanitizedRelPath -ne $file.RelativePath
 
         # Check if file already exists in target with same size
-        if (Test-Path -LiteralPath $targetFilePath) {
-            $existingSize = (Get-Item -LiteralPath $targetFilePath).Length
+        if ([System.IO.File]::Exists($targetFilePath)) {
+            $existingSize = ([System.IO.FileInfo]::new($targetFilePath)).Length
             if ($file.Size -lt 0 -or $existingSize -eq $file.Size) {
                 Write-Host "$progressPrefix SKIP: $($file.RelativePath) - already exists in target folder" -ForegroundColor DarkYellow
                 $stateWriter.WriteLine($file.RelativePath)
@@ -1524,6 +1584,29 @@ foreach ($file in $toProcess) {
                 if ($null -eq $script:lastTargetShellFolder) { throw "Cannot access target folder: $targetDir" }
                 $bmSw.Stop(); $bmTgt = $bmSw.ElapsedMilliseconds
 
+                # For sanitized files: CopyHere copies with the original MTP name,
+                # and Windows auto-renames it using PathCleanupSpec (removes invalid chars).
+                # Our sanitized name uses the same API, so it matches exactly.
+                # If that file already exists from a previous run, Windows shows an
+                # overwrite dialog that blocks forever. Fix: delete it before CopyHere.
+                $preExistingFiles = $null
+                if ($wasSanitized) {
+                    # Delete our sanitized target if it exists (we already decided to re-copy)
+                    if ([System.IO.File]::Exists($targetFilePath)) {
+                        try { [System.IO.File]::SetAttributes($targetFilePath, [System.IO.FileAttributes]::Normal) } catch {}
+                        [System.IO.File]::Delete($targetFilePath)
+                    }
+                    # Snapshot remaining files so we can diff after CopyHere
+                    $preExistingFiles = [System.Collections.Generic.HashSet[string]]::new(
+                        [StringComparer]::OrdinalIgnoreCase)
+                    $dirInfo = [System.IO.DirectoryInfo]::new($targetDir)
+                    if ($dirInfo.Exists) {
+                        foreach ($fi in $dirInfo.GetFiles()) {
+                            $preExistingFiles.Add($fi.Name) | Out-Null
+                        }
+                    }
+                }
+
                 # Start spinner, then CopyHere (blocks until MTP transfer is done)
                 $script:spinnerSync.Prefix = $progressPrefix
                 $script:spinnerSync.FileName = $file.RelativePath
@@ -1534,7 +1617,9 @@ foreach ($file in $toProcess) {
                 $script:spinnerSync.Active = $true
                 $fileCopyStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-                $script:lastTargetShellFolder.CopyHere($fileItem, 0x10)
+                # Flags: 0x4=no progress dialog, 0x10=yes to all, 0x400=no error UI
+                # Without 0x400, CopyHere hangs on error dialogs (e.g. invalid filename chars)
+                $script:lastTargetShellFolder.CopyHere($fileItem, 0x414)
 
                 $fileCopyStopwatch.Stop()
                 $script:spinnerSync.Active = $false
@@ -1542,22 +1627,52 @@ foreach ($file in $toProcess) {
 
                 # Verify file arrived (CopyHere is usually synchronous, but check)
                 $bmSw = [System.Diagnostics.Stopwatch]::StartNew()
+                $actualCopiedPath = $targetFilePath
                 if (-not [System.IO.File]::Exists($targetFilePath)) {
-                    $pollSw = [System.Diagnostics.Stopwatch]::StartNew()
-                    $script:spinnerSync.Active = $true
-                    while (-not [System.IO.File]::Exists($targetFilePath)) {
-                        if ($pollSw.Elapsed.TotalMinutes -gt $script:CopyTimeoutMinutes) {
-                            $script:spinnerSync.Active = $false
-                            throw "Timeout waiting for file"
+                    if ($wasSanitized) {
+                        # Filename had invalid Windows chars. CopyHere auto-renames the file.
+                        # Find the new file by comparing directory contents before/after.
+                        $newFileName = $null
+                        $dirInfo = [System.IO.DirectoryInfo]::new($targetDir)
+                        foreach ($fi in $dirInfo.GetFiles()) {
+                            if (-not $preExistingFiles.Contains($fi.Name)) {
+                                $newFileName = $fi.Name
+                                break
+                            }
                         }
-                        [System.Threading.Thread]::Sleep($script:CopyPollMs)
+                        if ($null -ne $newFileName) {
+                            $actualCopiedPath = Join-Path $targetDir $newFileName
+                            # Rename to our sanitized name
+                            if ($actualCopiedPath -ne $targetFilePath) {
+                                [System.IO.File]::Move($actualCopiedPath, $targetFilePath)
+                                $actualCopiedPath = $targetFilePath
+                            }
+                        } else {
+                            # CopyHere silently failed — file was not copied at all
+                            throw "CopyHere failed silently - filename contains characters invalid on Windows: $($file.FileName)"
+                        }
+                    } else {
+                        # Normal case: filename is valid, just wait for CopyHere to finish
+                        $pollSw = [System.Diagnostics.Stopwatch]::StartNew()
+                        $script:spinnerSync.Active = $true
+                        while (-not [System.IO.File]::Exists($targetFilePath)) {
+                            if ($pollSw.Elapsed.TotalMinutes -gt $script:CopyTimeoutMinutes) {
+                                $script:spinnerSync.Active = $false
+                                throw "Timeout waiting for file"
+                            }
+                            [System.Threading.Thread]::Sleep($script:CopyPollMs)
+                        }
+                        $script:spinnerSync.Active = $false
                     }
-                    $script:spinnerSync.Active = $false
                 }
                 $bmSw.Stop(); $bmVerify = $bmSw.ElapsedMilliseconds
 
                 # Clear spinner line
                 Write-Host "`r$(' ' * 160)`r" -NoNewline
+
+                if ($wasSanitized) {
+                    Write-Host "  [RENAMED] $($file.FileName) -> $([System.IO.Path]::GetFileName($targetFilePath)) (invalid Windows characters replaced)" -ForegroundColor DarkYellow
+                }
 
                 # CopyHere is atomic: if the file exists, it's complete.
                 $copiedSize = $file.Size

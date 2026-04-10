@@ -28,6 +28,7 @@ This script was developed by [mghomedev](https://github.com/mghomedev) with [Cla
 - **Path discovery** — if a path is not found on the device, lists available items at the last valid level
 - **Safety prompts** — warns if ignore folders are missing/empty or the index is empty
 - **Disconnect-safe** — automatically retries with exponential backoff when the phone is disconnected mid-operation; by default waits indefinitely for the phone to be reconnected
+- **Filename sanitization** — automatically renames files whose names are valid on Android/iOS but illegal on Windows (see [Filename Sanitization](#filename-sanitization) below)
 
 ## Installation
 
@@ -205,6 +206,31 @@ All cache files include a version header, a record of the input parameters (devi
 - **Incomplete file**: the previous run crashed or was interrupted before the cache was fully written (missing completion footer)
 
 You do not need to manually delete stale cache files — the script handles this automatically.
+
+## Filename Sanitization
+
+Android (ext4) and iOS (APFS) allow characters in filenames that are **illegal on Windows NTFS**. When copying files via MTP, these names would cause the copy to silently fail or hang. The script automatically detects and renames such files so that every file is copied successfully.
+
+### What gets sanitized
+
+| Rule | Example on device | Saved as on Windows |
+|---|---|---|
+| **Forbidden characters:** `< > : " / \ \| ? *` | `10:45:51_+0200_logcat.log` | `10_45_51_+0200_logcat.log` |
+| **Control characters** (0x00 - 0x1F) | `file\x01name.txt` | `file_name.txt` |
+| **Reserved device names:** CON, PRN, AUX, NUL, COM1-9, LPT1-9 | `NUL.txt` | `_NUL.txt` |
+| **Trailing dots or spaces** | `photo...` | `photo` |
+
+Forbidden characters are replaced with `_`. Reserved names are prefixed with `_`. Trailing dots and spaces are stripped.
+
+### Why this matters
+
+- **Android** commonly produces filenames with colons (e.g., log files with timestamps like `10:45:51_logcat.log`) and can contain any character except `/` and null
+- **iOS (APFS)** allows all characters except `/` and null -- user-created files, downloads, and attachments can contain colons, question marks, angle brackets, or quotes
+- **Windows NTFS** forbids 9 specific characters, all control characters, several reserved device names, and trailing dots/spaces
+
+Without sanitization, the MTP `CopyHere` call either fails silently or auto-renames the file unpredictably. The script would then poll for the original (illegal) filename and hang for up to 30 minutes before timing out.
+
+When a filename is sanitized, the script logs a `[RENAMED]` message showing the original and new name.
 
 ## Notes
 

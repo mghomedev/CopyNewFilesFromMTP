@@ -143,6 +143,19 @@ Retry wait times (`-RetryWaitSeconds`, `-RetryCount`) are command-line parameter
 - File sizes from MTP use `ExtendedProperty("System.Size")` with fallback to `GetDetailsOf` parsing
 - `CopyHere` is used for file transfers with flags `0x414` (no UI dialogs)
 
+### Windows NTFS Filename Sanitization
+- Android (ext4) and iOS (APFS) allow characters that are illegal on Windows NTFS
+- The script MUST sanitize all MTP filenames and directory names before constructing local paths
+- All sanitization logic lives in `Get-SanitizedRelativePath` and `Get-SanitizedComponent` near the top of the script
+- **Forbidden characters** replaced with `_`: `< > : " / \ | ? *` and control characters 0x00-0x1F
+- **Reserved device names** prefixed with `_`: CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9 (with or without extension)
+- **Trailing dots and spaces** are stripped (NTFS silently strips them, causing path mismatches)
+- If a name becomes empty after sanitization, it falls back to `_unnamed`
+- The original MTP path (`file.RelativePath`) is always used for state file tracking and dedup lookups — only local filesystem paths are sanitized
+- After `CopyHere`, if the filename was sanitized, the script searches the target directory for the auto-renamed file (Windows Shell may rename differently than we do) and renames it to our sanitized name
+- A `[RENAMED]` log message is printed whenever sanitization changes a filename, showing original and new name
+- Real-world example: Android log file `10:45:51_+0200_logcat.log` (colons valid on ext4, illegal on NTFS) — without sanitization, `CopyHere` auto-renames the file but the script polls for the original name and hangs for 30 minutes
+
 ## File Structure
 
 - `CopyNewFilesFromMTP.ps1` — main script
